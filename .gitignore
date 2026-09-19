@@ -1,0 +1,47 @@
+HELP.md
+target/
+.mvn/wrapper/maven-wrapper.jar
+!**/src/main/**/target/
+!**/src/test/**/target/
+
+### STS ###
+.apt_generated
+.classpath
+.factorypath
+.project
+.settings
+.springBeans
+.sts4-cache
+
+### IntelliJ IDEA ###
+.idea
+*.iws
+*.iml
+*.ipr
+
+### NetBeans ###
+/nbproject/private/
+/nbbuild/
+/dist/
+/nbdist/
+/.nb-gradle/
+build/
+!**/src/main/**/build/
+!**/src/test/**/build/
+
+### VS Code ###
+.vscode/
+
+### Local Kafka security dev stack (generated secrets, never commit) ###
+docker/certs/*.jks
+docker/certs/*_creds
+docker/certs/*.csr
+docker/certs/*.crt
+docker/certs/*.properties
+docker/.env
+docker/certs/ca-key
+docker/certs/ca-cert
+docker/certs/ca-cert.srl
+docker/kerberos/keytabs/
+docker/kerberos/kdc-data/
+

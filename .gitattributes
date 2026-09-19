@@ -1,0 +1,7 @@
+* text=auto
+/mvnw text eol=lf
+*.cmd text eol=crlf
+# Shell scripts and everything under docker/ is copied or mounted into Linux
+# containers, where a CRLF line ending breaks scripts and config files.
+*.sh text eol=lf
+docker/** text eol=lf

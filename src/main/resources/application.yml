@@ -1,0 +1,40 @@
+spring:
+  config:
+    # Passwords live in docker/.env (git-ignored), written by docker/certs/generate-certs.sh.
+    import: optional:file:docker/.env[.properties]
+  application:
+    name: SpringBootPractice
+  kafka:
+    bootstrap-servers: localhost:9094
+    properties:
+      security.protocol: SASL_SSL
+      sasl.mechanism: GSSAPI
+      sasl.kerberos.service.name: kafka
+      ssl.truststore.location: docker/certs/truststore.jks
+      ssl.truststore.password: ${KAFKA_TRUSTSTORE_PASSWORD}
+      ssl.keystore.location: docker/certs/client.keystore.jks
+      ssl.keystore.password: ${KAFKA_CLIENT_KEYSTORE_PASSWORD}
+      ssl.key.password: ${KAFKA_CLIENT_KEYSTORE_PASSWORD}
+      sasl.jaas.config: >-
+        com.sun.security.auth.module.Krb5LoginModule required
+        useKeyTab=true
+        storeKey=true
+        keyTab="docker/kerberos/keytabs/client.keytab"
+        principal="client@EXAMPLE.COM";
+      schema.registry.url: http://localhost:8081
+      specific.avro.reader: true
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: io.confluent.kafka.serializers.KafkaAvroSerializer
+    consumer:
+      group-id: dummy-consumer-group
+      auto-offset-reset: earliest
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      # Wrapped so a malformed record is reported and skipped instead of blocking the partition.
+      value-deserializer: org.springframework.kafka.support.serializer.ErrorHandlingDeserializer
+      properties:
+        spring.deserializer.value.delegate.class: io.confluent.kafka.serializers.KafkaAvroDeserializer
+
+app:
+  kafka:
+    topic: dummy-topic

@@ -1,0 +1,14 @@
+# Overlay for the "test" profile: lets the application context load with no
+# Kafka broker, Kerberos KDC or Schema Registry running.
+spring:
+  kafka:
+    listener:
+      auto-startup: false
+    properties:
+      security.protocol: PLAINTEXT
+      # Unused with PLAINTEXT, but the base config references docker/.env, which
+      # a fresh clone (or CI) doesn't have. These keep the placeholders resolvable.
+      ssl.truststore.password: unused
+      ssl.keystore.password: unused
+      ssl.key.password: unused
+      schema.registry.url: mock://test

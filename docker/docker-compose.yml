@@ -1,0 +1,88 @@
+services:
+  kdc:
+    build: ./kerberos
+    container_name: kafka-kdc
+    hostname: kdc
+    ports:
+      - "88:88/udp"
+      - "88:88/tcp"
+    volumes:
+      - ./kerberos/keytabs:/keytabs
+      - ./kerberos/kdc-data:/var/lib/krb5kdc
+    environment:
+      KDC_MASTER_PASSWORD: ${KDC_MASTER_PASSWORD:?Run docker/certs/generate-certs.sh first to create docker/.env}
+
+  kafka:
+    image: apache/kafka:3.8.0
+    container_name: kafka-broker
+    depends_on:
+      - kdc
+    ports:
+      - "9094:9094"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+      - ./init-topics.sh:/init-topics.sh:ro
+      - ./certs:/etc/kafka/secrets
+      - ./kerberos:/etc/kafka/kerberos:ro
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: CONTROLLER://:9093,SASL_SSL://:9094,INTERNAL://:9095
+      KAFKA_ADVERTISED_LISTENERS: SASL_SSL://localhost:9094,INTERNAL://kafka:9095
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: SASL_SSL
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,SASL_SSL:SASL_SSL,INTERNAL:SASL_SSL
+      KAFKA_LISTENER_NAME_INTERNAL_GSSAPI_SASL_JAAS_CONFIG: >-
+        com.sun.security.auth.module.Krb5LoginModule required
+        useKeyTab=true storeKey=true
+        keyTab="/etc/kafka/kerberos/keytabs/kafka.keytab"
+        principal="kafka/kafka@EXAMPLE.COM";
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_SSL_KEYSTORE_FILENAME: broker.keystore.jks
+      KAFKA_SSL_KEYSTORE_CREDENTIALS: broker_keystore_creds
+      KAFKA_SSL_KEY_CREDENTIALS: broker_key_creds
+      KAFKA_SSL_TRUSTSTORE_FILENAME: truststore.jks
+      KAFKA_SSL_TRUSTSTORE_CREDENTIALS: broker_truststore_creds
+      KAFKA_SSL_CLIENT_AUTH: required
+      KAFKA_SASL_ENABLED_MECHANISMS: GSSAPI
+      KAFKA_SASL_MECHANISM_INTER_BROKER_PROTOCOL: GSSAPI
+      KAFKA_SASL_KERBEROS_SERVICE_NAME: kafka
+      KAFKA_SUPER_USERS: "User:kafka;User:ANONYMOUS"
+      KAFKA_AUTHORIZER_CLASS_NAME: org.apache.kafka.metadata.authorizer.StandardAuthorizer
+      KAFKA_OPTS: "-Djava.security.krb5.conf=/etc/kafka/kerberos/krb5-broker.conf -Djava.security.auth.login.config=/etc/kafka/kerberos/broker_jaas.conf"
+
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.7.1
+    container_name: kafka-schema-registry
+    depends_on:
+      - kafka
+    ports:
+      - "8081:8081"
+    volumes:
+      - ./certs:/etc/kafka/secrets
+      - ./kerberos:/etc/kafka/kerberos:ro
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: SASL_SSL://kafka:9095
+      SCHEMA_REGISTRY_KAFKASTORE_SECURITY_PROTOCOL: SASL_SSL
+      SCHEMA_REGISTRY_KAFKASTORE_SASL_MECHANISM: GSSAPI
+      SCHEMA_REGISTRY_KAFKASTORE_SASL_KERBEROS_SERVICE_NAME: kafka
+      SCHEMA_REGISTRY_KAFKASTORE_SASL_JAAS_CONFIG: >-
+        com.sun.security.auth.module.Krb5LoginModule required
+        useKeyTab=true storeKey=true
+        keyTab="/etc/kafka/kerberos/keytabs/registry.keytab"
+        principal="registry/localhost@EXAMPLE.COM";
+      SCHEMA_REGISTRY_KAFKASTORE_SSL_TRUSTSTORE_LOCATION: /etc/kafka/secrets/truststore.jks
+      SCHEMA_REGISTRY_KAFKASTORE_SSL_TRUSTSTORE_PASSWORD: ${KAFKA_TRUSTSTORE_PASSWORD:?Run docker/certs/generate-certs.sh first to create docker/.env}
+      SCHEMA_REGISTRY_KAFKASTORE_SSL_KEYSTORE_LOCATION: /etc/kafka/secrets/registry.keystore.jks
+      SCHEMA_REGISTRY_KAFKASTORE_SSL_KEYSTORE_PASSWORD: ${KAFKA_REGISTRY_KEYSTORE_PASSWORD:?Run docker/certs/generate-certs.sh first to create docker/.env}
+      SCHEMA_REGISTRY_KAFKASTORE_SSL_KEY_PASSWORD: ${KAFKA_REGISTRY_KEYSTORE_PASSWORD:?Run docker/certs/generate-certs.sh first to create docker/.env}
+      SCHEMA_REGISTRY_KAFKASTORE_TOPIC: _schemas
+      JAVA_TOOL_OPTIONS: "-Djava.security.krb5.conf=/etc/kafka/kerberos/krb5-broker.conf"
+
+volumes:
+  kafka-data:

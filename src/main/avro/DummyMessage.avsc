@@ -1,0 +1,10 @@
+{
+  "type": "record",
+  "name": "DummyMessage",
+  "namespace": "com.practice.springbootpractice.avro",
+  "fields": [
+    {"name": "id", "type": "string"},
+    {"name": "text", "type": "string"},
+    {"name": "createdAt", "type": {"type": "long", "logicalType": "timestamp-millis"}}
+  ]
+}
