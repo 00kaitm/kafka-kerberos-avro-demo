@@ -1,11 +1,14 @@
 #!/bin/bash
-# Idempotent provisioning of the topics and ACLs the app and Schema Registry need.
-# Runs inside the broker container, as the super-user "kafka" principal:
-#   docker exec kafka-broker bash /init-topics.sh
-# Only needed after the kafka-data volume is deleted (e.g. docker compose down -v).
+# Idempotent provisioning of the topics and ACLs the app and Schema Registry need,
+# run as the super-user "kafka" principal.
+#
+# docker compose runs this automatically as the one-shot "topic-init" service, and
+# the Schema Registry only starts once it has finished. To run it again by hand:
+#   docker compose up topic-init
 set -euo pipefail
 
-BOOTSTRAP=localhost:9094
+# Inside the compose network the broker is reached on its internal listener.
+BOOTSTRAP=${KAFKA_BOOTSTRAP:-localhost:9094}
 CONFIG=/etc/kafka/secrets/admin-sasl-ssl.properties
 TOPICS=/opt/kafka/bin/kafka-topics.sh
 ACLS=/opt/kafka/bin/kafka-acls.sh
@@ -14,7 +17,7 @@ topics() { "$TOPICS" --bootstrap-server "$BOOTSTRAP" --command-config "$CONFIG" 
 acls()   { "$ACLS"   --bootstrap-server "$BOOTSTRAP" --command-config "$CONFIG" "$@"; }
 
 echo "Waiting for the broker..."
-for _ in $(seq 1 30); do
+for _ in $(seq 1 60); do
   if topics --list >/dev/null 2>&1; then break; fi
   sleep 2
 done

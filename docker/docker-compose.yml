@@ -21,7 +21,6 @@ services:
       - "9094:9094"
     volumes:
       - kafka-data:/var/lib/kafka/data
-      - ./init-topics.sh:/init-topics.sh:ro
       - ./certs:/etc/kafka/secrets
       - ./kerberos:/etc/kafka/kerberos:ro
     environment:
@@ -54,11 +53,32 @@ services:
       KAFKA_AUTHORIZER_CLASS_NAME: org.apache.kafka.metadata.authorizer.StandardAuthorizer
       KAFKA_OPTS: "-Djava.security.krb5.conf=/etc/kafka/kerberos/krb5-broker.conf -Djava.security.auth.login.config=/etc/kafka/kerberos/broker_jaas.conf"
 
+  # One-shot job: creates the topics and ACLs, then exits. The Schema Registry
+  # waits for it, because the registry fails on startup if its _schemas topic
+  # (and the ACLs that let it use that topic) don't exist yet.
+  topic-init:
+    image: apache/kafka:3.8.0
+    container_name: kafka-topic-init
+    depends_on:
+      - kafka
+    restart: "no"
+    entrypoint: ["bash", "/init-topics.sh"]
+    volumes:
+      - ./init-topics.sh:/init-topics.sh:ro
+      - ./certs:/etc/kafka/secrets
+      - ./kerberos:/etc/kafka/kerberos:ro
+    environment:
+      KAFKA_BOOTSTRAP: kafka:9095
+      KAFKA_OPTS: "-Djava.security.krb5.conf=/etc/kafka/kerberos/krb5-broker.conf"
+
   schema-registry:
     image: confluentinc/cp-schema-registry:7.7.1
     container_name: kafka-schema-registry
     depends_on:
-      - kafka
+      kafka:
+        condition: service_started
+      topic-init:
+        condition: service_completed_successfully
     ports:
       - "8081:8081"
     volumes:
