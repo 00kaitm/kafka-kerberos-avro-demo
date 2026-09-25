@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+	<modelVersion>4.0.0</modelVersion>
+
+	<groupId>com.practice</groupId>
+	<artifactId>spark-streaming</artifactId>
+	<version>0.0.1-SNAPSHOT</version>
+	<packaging>jar</packaging>
+	<name>spark-streaming</name>
+	<description>
+		Spark Structured Streaming job that reads the Avro DummyMessage topic the Spring Boot
+		app (../pom.xml) produces to, and prints the decoded records to the console. Standalone
+		Maven project, not a reactor module of the root pom, but run with the repo root as its
+		working directory so it can reuse the same docker/certs and docker/kerberos paths.
+	</description>
+
+	<properties>
+		<maven.compiler.source>17</maven.compiler.source>
+		<maven.compiler.target>17</maven.compiler.target>
+		<project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+		<spark.version>4.2.0</spark.version>
+		<scala.binary.version>2.13</scala.binary.version>
+	</properties>
+
+	<dependencies>
+		<dependency>
+			<groupId>org.apache.spark</groupId>
+			<artifactId>spark-core_${scala.binary.version}</artifactId>
+			<version>${spark.version}</version>
+		</dependency>
+		<dependency>
+			<groupId>org.apache.spark</groupId>
+			<artifactId>spark-sql_${scala.binary.version}</artifactId>
+			<version>${spark.version}</version>
+		</dependency>
+		<dependency>
+			<groupId>org.apache.spark</groupId>
+			<artifactId>spark-sql-kafka-0-10_${scala.binary.version}</artifactId>
+			<version>${spark.version}</version>
+		</dependency>
+		<dependency>
+			<groupId>org.apache.spark</groupId>
+			<artifactId>spark-avro_${scala.binary.version}</artifactId>
+			<version>${spark.version}</version>
+		</dependency>
+	</dependencies>
+
+	<build>
+		<plugins>
+			<plugin>
+				<groupId>org.apache.maven.plugins</groupId>
+				<artifactId>maven-compiler-plugin</artifactId>
+			</plugin>
+			<plugin>
+				<!--
+					Runs the job with `mvn exec:java`, using Maven's dependency-resolved
+					classpath directly, no shaded/uber jar needed for a local[*] job.
+					exec:java never forks a new process, so the add-opens flags Spark needs on
+					Java 17 (and -Dhadoop.home.dir, see README) have to be set on Maven's own JVM
+					via the MAVEN_OPTS environment variable before running exec:java, not here;
+					this plugin has no jvmArgs or fork parameter for this particular goal.
+				-->
+				<groupId>org.codehaus.mojo</groupId>
+				<artifactId>exec-maven-plugin</artifactId>
+				<version>3.5.0</version>
+				<configuration>
+					<mainClass>com.practice.sparkstreaming.SparkConsoleApp</mainClass>
+				</configuration>
+			</plugin>
+		</plugins>
+	</build>
+
+</project>

@@ -208,6 +208,121 @@ security, configured by `src/test/resources/application-test.yml` (profile `test
 
 The tests don't exercise Kerberos, TLS or ACLs. The Docker stack and a manual `POST` cover those.
 
+## Spark Structured Streaming (`spark-streaming/`)
+
+A second, independent reader of `dummy-topic`: a Java Spark Structured Streaming job that decodes the same
+Avro `DummyMessage` records and prints them to the console. It's a separate, standalone Maven project (its
+own `pom.xml`, not a module of the root one), because it has nothing to do with the Spring Boot app other
+than reading the same topic.
+
+```
+Spring Boot producer ──Avro──► dummy-topic ──┬──► DummyConsumer (@KafkaListener, group dummy-consumer-group)
+                                              └──► Spark job (spark-streaming, its own offsets, no group)
+```
+
+Both readers see every message. Spark's Kafka source doesn't join a consumer group the way `DummyConsumer`
+does - see "How Spark tracks offsets" - so the two don't compete for partitions or interfere with each
+other at all.
+
+### How Spark tracks offsets
+
+`DummyConsumer` uses a regular Kafka consumer group (`dummy-consumer-group`): the broker assigns it
+partitions, and after processing each record the consumer commits its offset back *to the broker*, so
+other members of the group (and the broker itself) know what's been read.
+
+Spark's Kafka source doesn't do any of that. It's not a member of any consumer group - `subscribe` in
+`SparkConsoleApp` just names the topic, not a group ID - so the broker has no idea what Spark has or
+hasn't read. Instead, at the end of every micro-batch, Spark writes the offsets it just processed into its
+own checkpoint directory (see "Checkpointing" below). On the next batch, or after a restart, it reads that
+checkpoint to know where to resume. This is *why* a checkpoint location is mandatory for every streaming
+query, console sink or not: without it, Spark has nowhere to remember offsets at all, and would have to
+start over from `startingOffsets` every single run.
+
+### Confluent's wire format, and why `from_avro` alone isn't enough
+
+Every record `KafkaAvroSerializer` writes has 5 bytes in front of the actual Avro binary: 1 magic byte,
+then a 4-byte big-endian ID identifying which schema (registered in the Schema Registry) wrote it. Spark's
+`from_avro` function expects to start reading Avro binary at byte 0, so handing it the raw Kafka record
+value produces garbage or an error - it doesn't know about that 5-byte header at all.
+
+Two ways to handle it:
+- **Strip the header and supply the schema** (what this does): drop the first 5 bytes with
+  `substring(value, 6, length(value) - 5)`, fetch the schema once from the Schema Registry's REST API, and
+  pass it to `from_avro`. A few lines of Java, no extra dependency, and it makes the wire format visible
+  instead of hiding it.
+- **ABRiS**: a library that does Schema-Registry-aware Avro decoding for you. It's Scala-first (implicit
+  DataFrame extensions), usable from Java but less natural, and it hides the byte-level detail the first
+  option makes explicit.
+
+`SchemaRegistry.fetchLatestSchema` (in `spark-streaming/src/main/java/com/practice/sparkstreaming/`) does a
+plain `GET /subjects/dummy-topic-value/versions/latest` against the registry - unauthenticated in this
+stack, see `docker-compose.yml` - and `SparkConsoleApp` does the byte-stripping and calls
+`org.apache.spark.sql.avro.functions.from_avro(Column, String)`.
+
+### Config
+
+`spark-streaming/src/main/resources/spark-streaming.properties` holds the bootstrap servers, topic, Schema
+Registry URL, checkpoint location, and the Kafka client security settings, passed straight through to
+Spark's Kafka source via its `kafka.`-prefixed options (the same settings `application.yml` sets under
+`spring.kafka.properties`, just re-pointed at the same keytab, truststore and client keystore). Passwords
+are `${VAR}` placeholders resolved from `docker/.env` at startup by `ConfigLoader`, the same file
+`application.yml` reads via Spring's `spring.config.import`.
+
+### Running it
+
+**One-time, Windows only:** Spark's checkpointing goes through Hadoop's local filesystem code, which on
+Windows needs a `winutils.exe` helper Spark doesn't ship. Run:
+
+```bash
+bash spark-streaming/setup-windows-hadoop.sh
+```
+
+This downloads `winutils.exe` and `hadoop.dll` from [cdarlint/winutils](https://github.com/cdarlint/winutils)
+(the community-maintained continuation of the original winutils project) into `spark-streaming/hadoop-local/`,
+git-ignored. Not needed on macOS/Linux.
+
+Then, with the Docker stack up (`docker compose up -d` in `docker/`, same as for the Spring Boot app):
+
+```bash
+bash spark-streaming/run.sh
+```
+
+`POST` a message the same way you would to test the Spring Boot app (see "Send a test message" above), and
+within a couple of seconds it prints a batch like:
+
+```
++------------------------------------+------+-----------------------+-----------+---------+------+-----------------------+
+|id                                  |text  |createdAt              |topic      |partition|offset|timestamp              |
++------------------------------------+------+-----------------------+-----------+---------+------+-----------------------+
+|7b2b9ee6-b765-4803-8821-b6d94081a815|hello |2026-09-25 18:34:36.061|dummy-topic|0        |6     |2026-09-25 18:34:36.385|
++------------------------------------+------+-----------------------+-----------+---------+------+-----------------------+
+```
+
+`run.sh` exists because `mvn exec:java` never forks a separate process, so the `--add-opens` flags Spark
+needs on Java 17 have to be set on Maven's own JVM via the `MAVEN_OPTS` environment variable rather than in
+`pom.xml` - the script sets that, plus `PATH` and `-Dhadoop.home.dir` for `winutils.exe`, and runs from the
+repo root so the relative keytab/truststore/checkpoint paths resolve.
+
+### Checkpointing
+
+`checkpointLocation` (in `spark-streaming.properties`, under `spark-streaming/checkpoint/`) is where a
+Structured Streaming query records which Kafka offsets it has already processed, plus other query state.
+On every batch it writes there before producing output, so if the job crashes and restarts, it resumes
+exactly where it left off instead of reprocessing everything or skipping records - the same guarantee a
+consumer group's committed offsets give a regular Kafka consumer, but tracked entirely on the Spark side.
+The console sink doesn't need exactly-once output (nothing downstream depends on not seeing a duplicate
+print), but every streaming query needs a checkpoint location regardless of sink, because that's where
+offset tracking and query state live.
+
+### Java 17 and Spark
+
+Spark 4.2.0 requires Java 17+, matching this project's `java.version`, but on Java 17 it needs
+`--add-opens` for several `java.base` packages its (Scala-based) internals access reflectively - without
+them it fails at startup with `InaccessibleObjectException`. `run.sh` sets these via `MAVEN_OPTS`. To run
+`SparkConsoleApp` from IntelliJ instead, copy the flags out of `run.sh` into the run configuration's VM
+options, set its working directory to the repo root (same requirement as the Spring Boot app, see
+"Run configurations (IntelliJ)" above), and add `hadoop-local/bin` to its `PATH` environment variable.
+
 ## Project layout
 
 ```
@@ -220,6 +335,14 @@ docker/
 src/main/avro/              Avro schema
 src/main/java/...           controller, producer, consumer
 src/test/                   unit, web-layer and embedded-Kafka tests
+spark-streaming/             standalone Maven project, not a module of the root pom.xml
+  pom.xml                    Spark 4.2.0, spark-sql-kafka-0-10, spark-avro
+  setup-windows-hadoop.sh    one-time, Windows only: downloads winutils.exe/hadoop.dll
+  run.sh                     sets MAVEN_OPTS (add-opens, hadoop.home.dir) and runs the job
+  src/main/resources/        spark-streaming.properties: bootstrap servers, topic, security
+  src/main/java/...          SparkConsoleApp, SchemaRegistry, ConfigLoader
+  hadoop-local/               downloaded winutils.exe/hadoop.dll, git-ignored
+  checkpoint/                 Structured Streaming checkpoint, git-ignored
 ```
 
 ## Troubleshooting
@@ -233,6 +356,8 @@ src/test/                   unit, web-layer and embedded-Kafka tests
 | App fails with a keytab / keystore "file not found" | The run configuration's working directory isn't the project root. |
 | App can't authenticate (`Cannot locate KDC`, `Server not found in Kerberos database`) | The KDC isn't running, or the app isn't using `docker/kerberos/krb5-client.conf`. Check `docker compose ps`. |
 | Docker commands from Git Bash mangle paths | Use PowerShell, or set `MSYS_NO_PATHCONV=1` and add Docker's `resources/bin` folder to `PATH`. |
+| Spark job fails with `HADOOP_HOME and hadoop.home.dir are unset`, or `Could not locate Hadoop executable: .../winutils.exe` | Windows only. Run `bash spark-streaming/setup-windows-hadoop.sh`, then use `spark-streaming/run.sh` (or copy its `MAVEN_OPTS`/`PATH` setup into your run configuration) rather than a bare `mvn exec:java`. |
+| Spark job fails with `InaccessibleObjectException` | Missing `--add-opens` flags for Java 17. Use `spark-streaming/run.sh`, which sets them via `MAVEN_OPTS`, rather than a bare `mvn exec:java`. |
 
 ## Design notes
 

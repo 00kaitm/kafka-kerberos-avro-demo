@@ -45,3 +45,8 @@ docker/certs/ca-cert.srl
 docker/kerberos/keytabs/
 docker/kerberos/kdc-data/
 
+### spark-streaming module ###
+spark-streaming/checkpoint/
+# Downloaded winutils.exe/hadoop.dll (Windows-only Hadoop shim), never commit third-party binaries.
+spark-streaming/hadoop-local/bin/
+
