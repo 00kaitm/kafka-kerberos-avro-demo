@@ -559,8 +559,8 @@ This stack runs a single broker, and every topic has replication factor 1.
 - **Replication factor can't exceed the number of brokers**, so RF=1 is the ceiling. If the broker's
   disk is lost, the data is gone, and while the broker is down nothing can be read or written.
 - **`min.insync.replicas`** (default 1) is the minimum number of in-sync replicas an `acks=all` write
-  needs. With RF=1 it can only usefully be 1. What it's *for* - refusing writes rather than accepting them
-  onto too few copies - only has meaning with more replicas.
+  needs. What it's *for* - refusing writes rather than accepting them onto too few copies - only has
+  meaning with more replicas. On one broker you can't even force it: see below.
 
 A 3-broker cluster with RF=3 and `min.insync.replicas=2` is the usual production setup: every
 acknowledged write is on at least 2 brokers, one broker can be down (or restarting for an upgrade) with no
@@ -568,36 +568,26 @@ errors and no data loss, and if two are down, `acks=all` writes are refused with
 rather than written to a single copy. Leader failover - another replica taking over the partition - also
 needs more than one broker to demonstrate.
 
-**The one part you *can* see on one broker:** the refusal. Put `min.insync.replicas=2` on a scratch
-topic with RF=1 and every `acks=all` write to it fails, since only 1 replica can ever be in sync. From
-`docker/`, with the stack up (this reuses the `topic-init` service's Kerberos admin setup):
+**Why you can't trigger `NotEnoughReplicas` on one broker, even on purpose.** Kafka lets you set
+`min.insync.replicas` higher than a topic's replication factor, but the broker doesn't enforce the
+impossible value: it uses `min(replication factor, min.insync.replicas)` (`effectiveMinIsr` in the
+broker's `Partition.scala`, present in the 3.8.0 broker used here). So an RF=1 topic with
+`min.insync.replicas=2` is treated as min ISR 1, and `acks=all` writes to it succeed. This was tried
+against this stack: creating such a topic works, and an `acks=all` console-producer write to it goes
+through with no error. The refusal only happens when a topic has *more* replicas than are currently in
+sync, which needs followers, which needs more than one broker.
 
-```powershell
-# 1. Scratch topic with an unsatisfiable min.insync.replicas
-docker compose run --rm --no-deps --entrypoint /opt/kafka/bin/kafka-topics.sh topic-init `
-  --bootstrap-server kafka:9095 --command-config /etc/kafka/secrets/admin-sasl-ssl.properties `
-  --create --topic min-isr-demo --partitions 1 --replication-factor 1 --config min.insync.replicas=2
-
-# 2. acks=all: refused. Lower the delivery timeout first, or this sits retrying for 2 minutes.
-docker compose run --rm --no-deps -T --entrypoint bash topic-init -c 'echo hello | /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server kafka:9095 --producer.config /etc/kafka/secrets/admin-sasl-ssl.properties --topic min-isr-demo --producer-property acks=all --producer-property request.timeout.ms=5000 --producer-property delivery.timeout.ms=15000'
-
-# 3. acks=1: accepted, because min.insync.replicas only applies to acks=all
-docker compose run --rm --no-deps -T --entrypoint bash topic-init -c 'echo hello | /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server kafka:9095 --producer.config /etc/kafka/secrets/admin-sasl-ssl.properties --topic min-isr-demo --producer-property acks=1'
-
-# 4. Clean up
-docker compose run --rm --no-deps --entrypoint /opt/kafka/bin/kafka-topics.sh topic-init `
-  --bootstrap-server kafka:9095 --command-config /etc/kafka/secrets/admin-sasl-ssl.properties `
-  --delete --topic min-isr-demo
-```
-
-**Why step 2 needs the timeout override.** `NotEnoughReplicasException` is a *retriable* error in the
-Kafka client, because in a real cluster a lagging replica usually catches up within seconds. So the
+**What you'd see in a real cluster, and the timeout trap.** `NotEnoughReplicasException` is a
+*retriable* error in the Kafka client, because a lagging replica usually catches up within seconds. So the
 producer doesn't fail right away: it logs `NOT_ENOUGH_REPLICAS` warnings and keeps retrying until
-`delivery.timeout.ms` (default 2 minutes) runs out. Then it reports the failure, either as
+`delivery.timeout.ms` (default 2 minutes) runs out, then reports the failure - either as
 `NotEnoughReplicasException` or as a `TimeoutException` ("Expiring 1 record(s)"), depending on whether
-the time ran out during a request or while waiting to retry. With the defaults it looks like a hang.
-`delivery.timeout.ms` has to be at least `request.timeout.ms` + `linger.ms`, which is why step 2 lowers
-both.
+time ran out during a request or while waiting to retry. From the application's side, that looks like a
+2-minute hang, not an error.
+
+**Harmless CLI warning.** Any Kafka CLI command run against this stack (including `init-topics.sh`) ends
+with `WARN ... TGT renewal thread has been interrupted and will exit`. That's the Kerberos login's
+background ticket-renewal thread being stopped as the short-lived CLI process exits - not an error.
 
 ### ACLs for idempotence
 
