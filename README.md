@@ -206,6 +206,7 @@ security, configured by `src/test/resources/application-test.yml` (profile `test
 | `SpringBootPracticeApplicationTests` | The Spring context loads with no broker running. |
 | `DummyMessageFlowIntegrationTest` | Producer → Avro → embedded Kafka → consumer, both directly and via an HTTP `POST`. |
 | `DummyMessageMalformedPayloadIntegrationTest` | A non-Avro record and a null-valued record on the topic don't block later valid messages. |
+| `ProducerReliabilityConfigTest` | The producer factory really has `acks=all` and `enable.idempotence=true` (see "Reliability"). |
 
 The tests don't exercise Kerberos, TLS or ACLs. The Docker stack and a manual `POST` cover those.
 
@@ -264,7 +265,7 @@ Two ways to handle it:
   DataFrame extensions), usable from Java but less natural, and it hides the byte-level detail the first
   option makes explicit.
 
-`SchemaRegistry.fetchLatestSchema` (in `spark-streaming/src/main/java/com/practice/sparkstreaming/`) does a
+`SchemaRegistry.fetchLatest` (in `spark-streaming/src/main/java/com/practice/sparkstreaming/`) does a
 plain `GET /subjects/dummy-topic-value/versions/latest` against the registry - unauthenticated in this
 stack, see `docker-compose.yml` - and `SparkConsoleApp` does the byte-stripping and calls
 `org.apache.spark.sql.avro.functions.from_avro(Column, String)`.
@@ -496,6 +497,132 @@ rather than requiring pandas/DuckDB/etc. just to look at the data. Remember appe
 window you just triggered won't appear here (or in Postgres, for that matter, since Postgres output for
 that window is still climbing) until the watermark has actually passed its end - for the defaults here,
 usually a few minutes after the messages that filled it were sent, not immediately.
+
+## Reliability
+
+### Idempotent producer
+
+Both producers - the Spring Boot `DummyProducer` (`application.yml`) and `LateDataProducer`
+(`spark-streaming.properties`, `producer.*` keys) - set these explicitly:
+
+| Setting | Value | Why it's there |
+|---|---|---|
+| `acks` | `all` | The partition leader only confirms a write once every in-sync replica has it. |
+| `enable.idempotence` | `true` | The broker drops duplicates caused by the producer's own retries. |
+
+Both have been the client defaults since Kafka 3.0 (KIP-679), so behaviour didn't change; being explicit
+matters because of a quiet rule in the client: if you set a config that conflicts with idempotence
+(`acks=1`, `retries=0`, or more than 5 in-flight requests) *without* explicitly enabling idempotence,
+the client just turns idempotence off. With `enable.idempotence=true` set explicitly, the same conflict
+fails at startup with a `ConfigException` instead.
+
+The related settings are left at their defaults, which are what idempotence expects:
+`retries` = `2147483647`, `max.in.flight.requests.per.connection` = `5` (idempotence requires ≤ 5),
+`delivery.timeout.ms` = `120000`. With retries effectively unlimited, `delivery.timeout.ms` is the real
+limit: the total time a `send()` may spend retrying before it reports failure.
+
+Spring Boot has a dedicated property for `acks` (`spring.kafka.producer.acks`) but not for idempotence,
+so that one goes in the pass-through map: `spring.kafka.producer.properties.enable.idempotence`. To confirm
+what the client actually ended up with, look for the `ProducerConfig values:` block the Kafka client logs
+when it creates a producer. Spring creates it lazily, so that's on the first `send()` (your first `POST`),
+not at application startup:
+
+```
+	acks = -1                        <- "all" is logged as -1
+	enable.idempotence = true
+	max.in.flight.requests.per.connection = 5
+	retries = 2147483647
+```
+
+followed by `Instantiated an idempotent producer.`
+
+**What idempotence does, in plain terms.** Each producer gets a producer ID from the broker, and numbers
+every batch it sends to each partition (a sequence number). If a send times out and the producer retries,
+but the first attempt had actually been written, the broker sees a sequence number it already has and
+discards the copy. It also rejects out-of-order sequences, which is what keeps retries from reordering
+records even with 5 requests in flight.
+
+**What it doesn't protect against.** That dedup only works *within one producer session*, per partition.
+If the app restarts, it gets a new producer ID and sequence numbers start over, so the broker has no way
+to tell a resent record from a new one. The same goes for application-level resends: if a caller `POST`s
+the same text twice, or code calls `send()` twice for the same thing, those are two different records as
+far as Kafka is concerned. Deduplicating those needs a business key on the consumer side (or the
+transactions covered later).
+
+### What one broker can and can't show
+
+This stack runs a single broker, and every topic has replication factor 1.
+
+- **`acks=all` on one broker behaves exactly like `acks=1`.** "All in-sync replicas" is just the leader,
+  because the leader is the only replica. The setting is correct and future-proof, but it adds no
+  durability here.
+- **Replication factor can't exceed the number of brokers**, so RF=1 is the ceiling. If the broker's
+  disk is lost, the data is gone, and while the broker is down nothing can be read or written.
+- **`min.insync.replicas`** (default 1) is the minimum number of in-sync replicas an `acks=all` write
+  needs. With RF=1 it can only usefully be 1. What it's *for* - refusing writes rather than accepting them
+  onto too few copies - only has meaning with more replicas.
+
+A 3-broker cluster with RF=3 and `min.insync.replicas=2` is the usual production setup: every
+acknowledged write is on at least 2 brokers, one broker can be down (or restarting for an upgrade) with no
+errors and no data loss, and if two are down, `acks=all` writes are refused with `NotEnoughReplicas`
+rather than written to a single copy. Leader failover - another replica taking over the partition - also
+needs more than one broker to demonstrate.
+
+**The one part you *can* see on one broker:** the refusal. Put `min.insync.replicas=2` on a scratch
+topic with RF=1 and every `acks=all` write to it fails, since only 1 replica can ever be in sync. From
+`docker/`, with the stack up (this reuses the `topic-init` service's Kerberos admin setup):
+
+```powershell
+# 1. Scratch topic with an unsatisfiable min.insync.replicas
+docker compose run --rm --no-deps --entrypoint /opt/kafka/bin/kafka-topics.sh topic-init `
+  --bootstrap-server kafka:9095 --command-config /etc/kafka/secrets/admin-sasl-ssl.properties `
+  --create --topic min-isr-demo --partitions 1 --replication-factor 1 --config min.insync.replicas=2
+
+# 2. acks=all: refused. Lower the delivery timeout first, or this sits retrying for 2 minutes.
+docker compose run --rm --no-deps -T --entrypoint bash topic-init -c 'echo hello | /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server kafka:9095 --producer.config /etc/kafka/secrets/admin-sasl-ssl.properties --topic min-isr-demo --producer-property acks=all --producer-property request.timeout.ms=5000 --producer-property delivery.timeout.ms=15000'
+
+# 3. acks=1: accepted, because min.insync.replicas only applies to acks=all
+docker compose run --rm --no-deps -T --entrypoint bash topic-init -c 'echo hello | /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server kafka:9095 --producer.config /etc/kafka/secrets/admin-sasl-ssl.properties --topic min-isr-demo --producer-property acks=1'
+
+# 4. Clean up
+docker compose run --rm --no-deps --entrypoint /opt/kafka/bin/kafka-topics.sh topic-init `
+  --bootstrap-server kafka:9095 --command-config /etc/kafka/secrets/admin-sasl-ssl.properties `
+  --delete --topic min-isr-demo
+```
+
+**Why step 2 needs the timeout override.** `NotEnoughReplicasException` is a *retriable* error in the
+Kafka client, because in a real cluster a lagging replica usually catches up within seconds. So the
+producer doesn't fail right away: it logs `NOT_ENOUGH_REPLICAS` warnings and keeps retrying until
+`delivery.timeout.ms` (default 2 minutes) runs out. Then it reports the failure, either as
+`NotEnoughReplicasException` or as a `TimeoutException` ("Expiring 1 record(s)"), depending on whether
+the time ran out during a request or while waiting to retry. With the defaults it looks like a hang.
+`delivery.timeout.ms` has to be at least `request.timeout.ms` + `linger.ms`, which is why step 2 lowers
+both.
+
+### ACLs for idempotence
+
+None needed beyond what `client` already has. Since Kafka 2.8 (KIP-679), `Write` on a topic is enough for
+an idempotent producer. The older cluster-level `IdempotentWrite` permission isn't required, and the
+broker here is 3.8. Transactions (added later) are different: they need permissions on a
+`TransactionalId` resource.
+
+### Client and broker versions
+
+The three Kafka components here are on three different versions:
+
+| Component | Kafka version |
+|---|---|
+| Broker (`apache/kafka` image) | 3.8.0 |
+| Spring Boot app (`kafka-clients`, managed by Spring Boot 4.1.1) | 4.2.1 |
+| `spark-streaming/` (`kafka-clients`, pinned to what Spark 4.2.0 resolves) | 3.9.2 |
+
+This is fine, and normal. Kafka clients and brokers negotiate on connect (the `ApiVersions` request)
+and each side uses the newest version of each request type both support, so a newer client works against
+an older broker and the other way round, within the supported range. Kafka 4.x clients need a 2.1+
+broker, and 3.8 is well above that. The catch is that **a feature only works if the broker supports it**, whatever
+the client version. For example, Kafka 4's new consumer group protocol (KIP-848, `group.protocol=consumer`)
+needs a 4.0+ broker, so against this 3.8 broker the consumers use the classic protocol. When a Kafka
+feature's docs say "since version X", check it against the **broker** version (3.8) as well as the client's.
 
 ## Project layout
 

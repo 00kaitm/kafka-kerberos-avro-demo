@@ -7,6 +7,7 @@ import org.apache.avro.generic.GenericRecord;
 import org.apache.avro.io.BinaryEncoder;
 import org.apache.avro.io.EncoderFactory;
 import org.apache.kafka.clients.producer.KafkaProducer;
+import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.common.serialization.ByteArraySerializer;
 import org.apache.kafka.common.serialization.StringSerializer;
@@ -60,8 +61,16 @@ public class LateDataProducer {
         producerProps.put("key.serializer", StringSerializer.class.getName());
         producerProps.put("value.serializer", ByteArraySerializer.class.getName());
         for (String key : config.stringPropertyNames()) {
+            // kafka.* is shared with Spark's (consumer-side) Kafka source, so only take the keys a
+            // producer actually understands - the connection and security settings - and leave
+            // consumer-only ones like kafka.isolation.level behind.
             if (key.startsWith("kafka.")) {
-                producerProps.put(key.substring("kafka.".length()), config.getProperty(key));
+                String name = key.substring("kafka.".length());
+                if (ProducerConfig.configNames().contains(name)) {
+                    producerProps.put(name, config.getProperty(key));
+                }
+            } else if (key.startsWith("producer.")) {
+                producerProps.put(key.substring("producer.".length()), config.getProperty(key));
             }
         }
 

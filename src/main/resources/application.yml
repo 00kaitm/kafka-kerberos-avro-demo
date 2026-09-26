@@ -26,6 +26,14 @@ spring:
     producer:
       key-serializer: org.apache.kafka.common.serialization.StringSerializer
       value-serializer: io.confluent.kafka.serializers.KafkaAvroSerializer
+      # Both are already the client defaults (Kafka 3.0+), set explicitly so an unrelated
+      # config change can't silently turn them off - see README "Reliability".
+      acks: all
+      properties:
+        # Boot has no dedicated property for this one, so it goes in the pass-through map.
+        enable.idempotence: true
+        # retries, max.in.flight.requests.per.connection and delivery.timeout.ms are left at
+        # their defaults (MAX_INT, 5, 120000), which are what idempotence requires/expects.
     consumer:
       group-id: dummy-consumer-group
       auto-offset-reset: earliest
