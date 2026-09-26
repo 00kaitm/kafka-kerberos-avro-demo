@@ -24,6 +24,9 @@ done
 topics --list >/dev/null
 
 topics --create --if-not-exists --topic dummy-topic --partitions 1 --replication-factor 1
+# Dead-letter topic for dummy-topic (app.kafka.dlt-topic). Same partition count as dummy-topic:
+# the app dead-letters a record to the same partition number it came from.
+topics --create --if-not-exists --topic dummy-topic-dlt --partitions 1 --replication-factor 1
 topics --create --if-not-exists --topic _schemas --partitions 1 --replication-factor 1 \
   --config cleanup.policy=compact
 
@@ -31,6 +34,13 @@ topics --create --if-not-exists --topic _schemas --partitions 1 --replication-fa
 acls --add --allow-principal User:client \
   --operation Write --operation Read --operation Describe --topic dummy-topic
 acls --add --allow-principal User:client --operation Read --group dummy-consumer-group
+
+# App client: the error handler writes failed records to the DLT, and DeadLetterInspector reads them
+# back in its own group (app.kafka.dlt-group-id). Describe also lets the error handler check the
+# DLT partition exists before publishing to it.
+acls --add --allow-principal User:client \
+  --operation Write --operation Read --operation Describe --topic dummy-topic-dlt
+acls --add --allow-principal User:client --operation Read --group dummy-dlt-inspector
 
 # Schema Registry: owns the _schemas topic.
 acls --add --allow-principal User:registry \

@@ -46,3 +46,22 @@ spring:
 app:
   kafka:
     topic: dummy-topic
+    # Where records go once retries are exhausted, or straight away for ones that can never
+    # succeed. Created by docker/init-topics.sh. See README "Retries and the dead-letter topic".
+    dlt-topic: dummy-topic-dlt
+    dlt-group-id: dummy-dlt-inspector
+    retry:
+      # Waits 1s, 2s, 4s, 4s between the 5 attempts (1 + 4 retries): 11s of back off in total.
+      # max-interval caps the doubling. The back off sleeps the consumer thread, so it counts
+      # against the consumer's max.poll.interval.ms (default 300s) - keep it well under that.
+      initial-interval-ms: 1000
+      multiplier: 2.0
+      max-interval-ms: 4000
+      max-retries: 4
+    # Text markers that make DummyConsumer fail on purpose, plus the poison-pill endpoint.
+    failure-demo:
+      enabled: true
+      transient-marker: fail-transient   # fails the first transient-failures attempts, then succeeds
+      transient-failures: 2
+      always-marker: fail-always         # retryable, but never succeeds: exhausts retries, then DLT
+      invalid-marker: fail-invalid       # not retryable: straight to the DLT

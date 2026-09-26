@@ -14,6 +14,7 @@ import org.springframework.test.context.bean.override.mockito.MockitoSpyBean;
 import org.springframework.test.web.servlet.MockMvc;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.Mockito.timeout;
 import static org.mockito.Mockito.verify;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
@@ -32,7 +33,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 })
 @ActiveProfiles("test")
 @AutoConfigureMockMvc
-@EmbeddedKafka(partitions = 1, topics = "dummy-topic")
+@EmbeddedKafka(partitions = 1, topics = {"dummy-topic", "dummy-topic-dlt"})
 @DirtiesContext
 class DummyMessageFlowIntegrationTest {
 
@@ -54,7 +55,7 @@ class DummyMessageFlowIntegrationTest {
                 .andExpect(content().string("queued"));
 
         ArgumentCaptor<DummyMessage> received = ArgumentCaptor.forClass(DummyMessage.class);
-        verify(consumer, timeout(15_000)).listen(received.capture());
+        verify(consumer, timeout(15_000)).listen(received.capture(), anyInt());
         assertThat(received.getValue().getText().toString()).isEqualTo("posted over http");
     }
 
@@ -63,7 +64,7 @@ class DummyMessageFlowIntegrationTest {
         producer.send("through the embedded broker");
 
         ArgumentCaptor<DummyMessage> received = ArgumentCaptor.forClass(DummyMessage.class);
-        verify(consumer, timeout(15_000)).listen(received.capture());
+        verify(consumer, timeout(15_000)).listen(received.capture(), anyInt());
 
         DummyMessage message = received.getValue();
         assertThat(message.getText().toString()).isEqualTo("through the embedded broker");

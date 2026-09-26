@@ -20,6 +20,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.Map;
 
 import static org.mockito.ArgumentMatchers.argThat;
+import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.Mockito.timeout;
 import static org.mockito.Mockito.verify;
 
@@ -33,7 +34,7 @@ import static org.mockito.Mockito.verify;
         "spring.kafka.listener.auto-startup=true"
 })
 @ActiveProfiles("test")
-@EmbeddedKafka(partitions = 1, topics = "dummy-topic")
+@EmbeddedKafka(partitions = 1, topics = {"dummy-topic", "dummy-topic-dlt"})
 @DirtiesContext
 class DummyMessageMalformedPayloadIntegrationTest {
 
@@ -68,7 +69,7 @@ class DummyMessageMalformedPayloadIntegrationTest {
 
     private void verifyConsumerEventuallyReceives(String text) {
         verify(consumer, timeout(30_000)).listen(argThat(
-                (DummyMessage m) -> m != null && text.equals(m.getText().toString())));
+                (DummyMessage m) -> m != null && text.equals(m.getText().toString())), anyInt());
     }
 
     /** Publishes with a plain byte[] serializer, bypassing Avro and the schema registry. */

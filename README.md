@@ -10,18 +10,29 @@ Kerberos KDC and a Schema Registry in Docker.
 2. The **producer** wraps it in an Avro `DummyMessage` (`id`, `text`, `createdAt`) and publishes it to the
    Kafka topic `dummy-topic`.
 3. The **consumer**, in the same app, receives it from that topic and logs it.
+4. If the consumer fails on a record, it **retries** with back off; if it still can't process it (or it can
+   never succeed, like bytes that aren't Avro), the record goes to the **dead-letter topic** `dummy-topic-dlt`
+   instead of being lost or blocking the topic. See [Reliability](#reliability).
 
 ```
-                                     ┌───────────────────── Docker ─────────────────────┐
- curl / Postman                      │                                                  │
-      │  POST text                   │   KDC (Kerberos) :88     Schema Registry :8081   │
-      ▼                              │        ▲                        ▲                │
-┌──────────────────────── Spring Boot app :8080 ─────────────┐        │                │
-│ DummyMessageController ─► DummyProducer ──Avro──►          │   ┌────┴───────────┐    │
-│                                              Kafka :9094 ◄─┼──►│  Kafka broker  │    │
-│ DummyConsumer  ◄──────────────────────Avro───              │   │  (KRaft, ACLs) │    │
-└─────────────────────────────────────────────────────────────┘   └────────────────┘    │
-                                     └──────────────────────────────────────────────────┘
+ curl / Postman
+      │  POST /dummy-topic/messages   (or /dummy-topic/poison-pill for the failure demo)
+      ▼
+┌──────────────── Spring Boot app :8080 ─────────────────┐     ┌───────────── Docker ─────────────┐
+│ DummyMessageController ─► DummyProducer ── Avro ───────┼────►│ dummy-topic                      │
+│ PoisonPillController ── raw bytes (demo) ──────────────┼────►│                                  │
+│                                                        │     │                                  │
+│ DummyConsumer ◄ ───────────────────────────────────────┼─────│ dummy-topic                      │
+│   │ throws                                             │     │                                  │
+│   ▼                                                    │     │                                  │
+│ DefaultErrorHandler: retries, then ────────────────────┼────►│ dummy-topic-dlt                  │
+│                                                        │     │                                  │
+│ DeadLetterInspector ◄ ─────────────────────────────────┼─────│ dummy-topic-dlt                  │
+└────────────────────────────────────────────────────────┘     │                                  │
+                                                               │ Kafka broker :9094 (KRaft, ACLs) │
+                                                               │ KDC (Kerberos) :88               │
+                                                               │ Schema Registry :8081            │
+                                                               └──────────────────────────────────┘
 ```
 
 Expected log output when it works:
@@ -37,9 +48,15 @@ DummyConsumer : Received message: id=06fb7c55-... text=hello createdAt=2026-09-1
 |---|---|
 | `kafka/DummyMessageController.java` | `POST /dummy-topic/messages`. Passes the body to the producer and returns `queued`. |
 | `kafka/DummyProducer.java` | Builds a `DummyMessage` (random UUID, current time) and sends it with `KafkaTemplate`. Logs success or failure asynchronously. |
-| `kafka/DummyConsumer.java` | `@KafkaListener` on the topic, group `dummy-consumer-group`. Logs each message. |
+| `kafka/DummyConsumer.java` | `@KafkaListener` on the topic, group `dummy-consumer-group`. Logs each message, with its delivery attempt number. |
+| `kafka/KafkaErrorHandlingConfig.java` | The `DefaultErrorHandler`: capped exponential back off, which exceptions skip retries, and the `DeadLetterPublishingRecoverer`. |
+| `kafka/DeadLetterInspector.java` | `@KafkaListener` on `dummy-topic-dlt`, group `dummy-dlt-inspector`. Logs where each dead letter came from and why it failed. |
+| `kafka/FailureDemo.java` | Makes `DummyConsumer` fail on purpose for texts starting with `fail-transient`, `fail-always` or `fail-invalid`. |
+| `kafka/PoisonPillController.java` | `POST /dummy-topic/poison-pill`. Publishes the body as raw bytes, not Avro. Demo only (`app.kafka.failure-demo.enabled`). |
+| `kafka/RawBytesProducer.java` | A `byte[]` producer sharing Boot's producer config, for the DLT and the poison-pill endpoint. |
+| `kafka/RetryableProcessingException.java`, `kafka/InvalidMessageException.java` | The two failure kinds: worth retrying, and never worth retrying. |
 | `src/main/avro/DummyMessage.avsc` | Avro schema. The `avro-maven-plugin` generates the `DummyMessage` class at build time. |
-| `src/main/resources/application.yml` | Kafka, Kerberos, TLS and Schema Registry client settings. |
+| `src/main/resources/application.yml` | Kafka, Kerberos, TLS and Schema Registry client settings; topic names, retry/back off and failure-demo settings under `app.kafka`. |
 
 ## How the security setup works
 
@@ -50,7 +67,8 @@ The broker only accepts clients that authenticate with **Kerberos (SASL/GSSAPI) 
   (Schema Registry). The app logs in with `client.keytab` (see `sasl.jaas.config` in `application.yml`).
 - **TLS:** `docker/certs/` holds a dev CA plus keystores and a truststore, generated by
   `docker/certs/generate-certs.sh` with random passwords.
-- **ACLs:** `client` may write, read and describe `dummy-topic` and read group `dummy-consumer-group`.
+- **ACLs:** `client` may write, read and describe `dummy-topic` and `dummy-topic-dlt`, and read groups
+  `dummy-consumer-group` and `dummy-dlt-inspector`.
   `registry` owns the `_schemas` topic. `docker/init-topics.sh` creates the topics and ACLs. The `topic-init`
   service in `docker-compose.yml` runs it automatically on `docker compose up`, and the Schema Registry waits for it
   to finish, because the registry fails on startup if `_schemas` and its ACLs don't exist yet.
@@ -207,6 +225,7 @@ security, configured by `src/test/resources/application-test.yml` (profile `test
 | `DummyMessageFlowIntegrationTest` | Producer → Avro → embedded Kafka → consumer, both directly and via an HTTP `POST`. |
 | `DummyMessageMalformedPayloadIntegrationTest` | A non-Avro record and a null-valued record on the topic don't block later valid messages. |
 | `ProducerReliabilityConfigTest` | The producer factory really has `acks=all` and `enable.idempotence=true` (see "Reliability"). |
+| `DeadLetterIntegrationTest` | Each failure path: retried then succeeded, retries exhausted then DLT, not retryable so straight to DLT, and a poison pill reaching the DLT with its original bytes and headers. |
 
 The tests don't exercise Kerberos, TLS or ACLs. The Docker stack and a manual `POST` cover those.
 
@@ -614,18 +633,206 @@ the client version. For example, Kafka 4's new consumer group protocol (KIP-848,
 needs a 4.0+ broker, so against this 3.8 broker the consumers use the classic protocol. When a Kafka
 feature's docs say "since version X", check it against the **broker** version (3.8) as well as the client's.
 
+### Retries and the dead-letter topic
+
+When `DummyConsumer.listen` throws, Spring hands the record to an **error handler**, which decides between
+three outcomes: try the same record again, give up and park it on a **dead-letter topic (DLT)**, or both
+(retry a few times, then park it). Parking it matters because a Kafka consumer reads each partition in
+order: until a record is either processed or moved out of the way, nothing behind it on that partition
+gets processed either.
+
+#### Blocking vs. non-blocking retries
+
+Spring Kafka offers two styles:
+
+| | **Blocking** (`DefaultErrorHandler` + `BackOff`) - used here | **Non-blocking** (`@RetryableTopic`) |
+|---|---|---|
+| How a retry happens | The consumer seeks back to the failed record, sleeps for the back off, and redelivers it. | The failed record is published to a retry topic named after its delay (e.g. `dummy-topic-retry-1000`) and its offset committed; a consumer on the retry topic delivers it again once its delay is up. |
+| Other records on the same partition | Wait until the failed one is done (processed or dead-lettered). | Keep flowing; only the failed record is delayed. |
+| Ordering | **Preserved.** Nothing overtakes a failing record. | **Lost** for failed records: later records are processed before an earlier one's retry. |
+| Extra topics | Just the DLT. | One retry topic per delay level (or one with a fixed delay), plus the DLT, plus ACLs for each. |
+| Good for | Short, bounded retries where order matters. | Long delays (minutes) where holding up the partition is worse than reordering. |
+
+This project uses **blocking retries**. The back off is short (seconds), `DummyConsumer` has no reason to
+accept reordering (Spring's docs: with non-blocking retries "you lose Kafka's ordering guarantees for that
+topic"), and while Spring would normally create the retry topics itself, `client` has no `Create` ACL on this
+broker, so each one would have to be provisioned in `init-topics.sh`. The cost is head-of-line
+blocking: while one record is being retried, the rest of its partition waits.
+
+#### Which failures are retried
+
+`KafkaErrorHandlingConfig` retries **everything except** failures that can't be fixed by trying again:
+
+| Failure | Retried? | Why |
+|---|---|---|
+| `DeserializationException` (bytes that aren't valid Avro) | No - straight to the DLT | The bytes won't change. Built into Spring's not-retryable list, along with `MessageConversionException`, `ConversionException`, `MethodArgumentResolutionException`, `NoSuchMethodException` and `ClassCastException`. |
+| `InvalidMessageException` (decoded fine, breaks a business rule) | No - straight to the DLT | The record won't change either. Added with `addNotRetryableExceptions`. |
+| `RetryableProcessingException`, or anything else | Yes, with back off | Might be a temporary problem (a downstream timeout, a lock). |
+
+Spring checks the exception's *causes* too, so it doesn't matter that the listener's exception arrives
+wrapped in a `ListenerExecutionFailedException`.
+
+#### Back off, and the worst-case time
+
+`app.kafka.retry` in `application.yml`: first wait 1s, doubling each time, **capped at 4s**, at most 4
+retries - so 5 attempts, with waits of **1s, 2s, 4s, 4s = 11s of back off in total**. Without the cap
+(`max-interval-ms`), the 4th wait would be 8s, and each extra retry would double it again.
+
+Why the cap matters: Kafka's `max.poll.interval.ms` (default 300s) is the longest a consumer may go between
+`poll()` calls before the broker decides it's stuck, kicks it out of the group and rebalances. Spring's
+default back off handler **sleeps the consumer thread**, so back off time counts toward that limit. The worst
+case for one failing record, from its first failure to its offset being committed:
+
+| Step | Worst case |
+|---|---|
+| 5 attempts of `DummyConsumer.listen` | ~milliseconds each here |
+| Back off between them | 11s |
+| Publishing to the DLT | up to 125s, *only if the broker is unreachable*: the recoverer waits for the send result for `delivery.timeout.ms` (120s) + 5s. Normally milliseconds. |
+| **Total** | **~136s worst case, ~11s normally** - against a 300s limit |
+
+That's the pessimistic reading, counting the whole sequence as one gap between polls. In practice
+`DefaultErrorHandler` seeks back and returns to `poll()` after every failed attempt, so each individual gap is
+at most one back off (4s) plus processing - except the last, which includes the DLT publish. If you ever
+need waits longer than `max.poll.interval.ms`, that's what `@RetryableTopic`, or Spring's
+`ContainerPausingBackOffHandler`, is for.
+
+#### The dead-letter topic
+
+`DeadLetterPublishingRecoverer` publishes the failed record to `dummy-topic-dlt` (`app.kafka.dlt-topic`),
+**to the same partition number** it came from, and adds headers recording what happened:
+
+| Header | Content |
+|---|---|
+| `kafka_dlt-original-topic` / `-partition` / `-offset` / `-timestamp` | Where the record originally was. Partition and offset are binary (4-byte int, 8-byte long). |
+| `kafka_dlt-original-consumer-group` | The group that failed to process it (`dummy-consumer-group`). |
+| `kafka_dlt-exception-fqcn`, `kafka_dlt-exception-cause-fqcn` | The exception class, and its cause's. For processing failures the outer one is Spring's `ListenerExecutionFailedException`; the cause is yours. |
+| `kafka_dlt-exception-message`, `kafka_dlt-exception-stacktrace` | The message and full stack trace. |
+
+The record's own key, value and headers are kept. The DLT therefore holds **two kinds of value**:
+- **Processing failures** (`fail-always`, `fail-invalid`) had already been decoded into a `DummyMessage`, so
+  they're re-encoded as Avro. The Avro serializer registers a new Schema Registry subject,
+  `dummy-topic-dlt-value`, the first time this happens.
+- **Deserialization failures** (poison pills) never became a `DummyMessage`. `ErrorHandlingDeserializer`
+  saves the original bytes in a header, and the recoverer writes **those exact bytes** as the DLT value,
+  through a `byte[]` producer (`RawBytesProducer`). `KafkaErrorHandlingConfig` maps value types to
+  producers so each kind gets the right serializer.
+
+`DeadLetterInspector` reads the DLT as raw bytes (so it can handle both kinds), tries to decode each value as
+Avro, and logs one line per dead letter. It never throws: it uses the same error handler, so a failure in it
+would dead-letter a dead letter.
+
+Nothing re-processes the DLT automatically. That's deliberate - a DLT is for a person (or a separate, careful
+tool) to look at, fix the cause, and decide whether to replay.
+
+```
+ dummy-topic ─► DummyConsumer.listen()
+                     │
+         succeeded ──┼──► offset committed, next record
+                     │
+             threw   ▼
+          DefaultErrorHandler: what kind of exception?
+             │                                   │
+             │ not retryable                     │ retryable
+             │ (DeserializationException,        │ (RetryableProcessingException,
+             │  InvalidMessageException, ...)    │  anything else)
+             │                                   ▼
+             │                        retries left? ── yes ──► sleep 1s / 2s / 4s / 4s,
+             │                                   │              redeliver the same record
+             │                                   │ no           (rest of the partition waits)
+             ▼                                   ▼
+          DeadLetterPublishingRecoverer ──► dummy-topic-dlt, same partition #, + kafka_dlt-* headers
+             │                                   │
+             ▼                                   ▼
+   offset committed, next record       DeadLetterInspector logs it
+```
+
+#### Triggering each path
+
+If your Docker stack was created before the DLT existed, create the new topic and ACLs first, from `docker/`:
+
+```powershell
+docker compose up topic-init
+```
+
+Then, with the app running, from PowerShell:
+
+```powershell
+$u = "http://localhost:8080/dummy-topic"
+Invoke-WebRequest -Uri "$u/messages"    -Method POST -ContentType "text/plain" -Body "fail-transient-1"  # fails twice, then succeeds
+Invoke-WebRequest -Uri "$u/messages"    -Method POST -ContentType "text/plain" -Body "fail-always-1"     # 5 attempts over ~11s, then DLT
+Invoke-WebRequest -Uri "$u/messages"    -Method POST -ContentType "text/plain" -Body "fail-invalid-1"    # 1 attempt, then DLT
+Invoke-WebRequest -Uri "$u/poison-pill" -Method POST -ContentType "text/plain" -Body "not avro"          # not Avro at all: DLT
+```
+
+The markers are prefixes (`app.kafka.failure-demo.*`), so add a suffix to tell attempts apart. What to look
+for in the app's log:
+
+| Sent | Log |
+|---|---|
+| `fail-transient-1` | Two `FailureDemo : Simulating a transient failure ... attempt 1 of 2` / `attempt 2 of 2` warnings, about 1s and 2s apart, then `DummyConsumer : Received message ... (delivery attempt 3)`. |
+| `fail-always-1` | Five `Simulating a failure that never recovers ... attempt N` warnings over ~11s, then `DeadLetterInspector : Dead letter at dummy-topic-dlt-0@... from dummy-topic-0@... failed with ...RetryableProcessingException: Simulated permanent outage ... (attempt 5) \| value: Avro {...}`. |
+| `fail-invalid-1` | No retries: straight to `Dead letter ... failed with ...InvalidMessageException: Simulated validation failure ...`. |
+| poison pill | The endpoint answers `sent raw bytes to dummy-topic partition 0 offset N`, then `Dead letter ... from dummy-topic-0@N ... failed with org.springframework.kafka.support.serializer.DeserializationException: failed to deserialize \| value: 8 raw bytes, not decodable as Avro: hex 6e6f74206176726f / text "not avro"`. |
+
+To see the headers exactly as stored, read the DLT with the console consumer (from `docker/`):
+
+```powershell
+docker compose run --rm --no-deps --entrypoint /opt/kafka/bin/kafka-console-consumer.sh topic-init `
+  --bootstrap-server kafka:9095 --consumer.config /etc/kafka/secrets/admin-sasl-ssl.properties `
+  --topic dummy-topic-dlt --from-beginning --timeout-ms 10000 `
+  --property print.headers=true --property print.offset=true
+```
+
+Text headers print as text. `kafka_dlt-original-partition` and `-offset` are binary numbers, so they show
+up as unreadable characters there; `DeadLetterInspector`'s log line decodes them.
+
+To turn the demo triggers off (the markers become ordinary text, and the poison-pill endpoint disappears),
+set `app.kafka.failure-demo.enabled=false`.
+
+### Poison pills and the Spark jobs
+
+The poison pill goes to `dummy-topic`, which both Spark apps also read. They don't use Spring's error
+handler, so they need their own defence.
+
+**What would happen without one.** `from_avro` defaults to `FAILFAST`: a record it can't decode throws,
+which fails the whole micro-batch, which stops the query. Because the batch failed, the checkpoint never
+records it as done, so restarting the job re-reads exactly the same batch, hits the same record, and fails
+again, forever. The only ways out would be deleting the checkpoint (reprocessing everything, or skipping
+everything with `startingOffsets=latest`) or hand-editing it past the bad offset.
+
+**What `KafkaAvroSource` does instead**, before any app-specific logic sees the data:
+1. **Header check.** A Confluent Avro record is at least 5 bytes and starts with magic byte `0`. Anything
+   else (the poison pill's text, a null tombstone) is skipped without calling `from_avro` at all.
+2. **`from_avro` in `PERMISSIVE` mode.** A payload that has the header but won't parse no longer throws.
+   One subtlety, found while testing this: for a record schema, `PERMISSIVE` doesn't return a null
+   struct, it returns a struct with *every field* null. So the filter checks that `id` - a required field in
+   `DummyMessage.avsc` - is non-null, not just that the struct is.
+3. **Counting.** `Dataset.observe` attaches a `received` / `skipped` count to every micro-batch, and a
+   `StreamingQueryListener` logs a warning for any batch that skipped something:
+   `WARN KafkaAvroSource: Query ... batch N: skipped 1 of 1 Kafka records that aren't valid Confluent Avro`.
+   The same numbers appear under `observedMetrics` in each query's progress (`query.lastProgress()`).
+
+Skipped records are dropped, not dead-lettered: the Spark apps only read `dummy-topic`, and the Spring
+app's DLT already has a copy of anything that failed to deserialize there.
+
+**What this can't catch.** Avro binary isn't self-describing: it's just values back to back, and the
+schema says how to read them. So a payload that starts with `0` + a schema ID and whose remaining bytes
+*happen* to parse against the schema decodes "successfully" into nonsense. For example,
+`00 00 00 00 01 02 61 02 62 00` decodes as `id="a", text="b", createdAt=1970-01-01`. Nothing can detect
+that from the bytes alone; only validation of the decoded values could.
+
 ## Project layout
 
 ```
 docker/
   docker-compose.yml        KDC, Kafka broker (KRaft), Schema Registry and Postgres
-  init-topics.sh            creates dummy-topic, _schemas and the ACLs (idempotent; run by the topic-init service)
+  init-topics.sh            creates dummy-topic, dummy-topic-dlt, _schemas and the ACLs (idempotent; run by the topic-init service)
   certs/                    generate-certs.sh; the CA, keystores and truststore it creates are git-ignored
   .env.example              the variable names of docker/.env (the real, generated .env is git-ignored)
   kerberos/                 KDC image, krb5 configs, keytabs (generated), KDC database (generated)
   postgres/init-topic-counts.sql   creates topic_counts; run once by the postgres image on first startup
 src/main/avro/              Avro schema
-src/main/java/...           controller, producer, consumer
+src/main/java/...           controllers, producer, consumer, error handling / DLT
 src/test/                   unit, web-layer and embedded-Kafka tests
 spark-streaming/             standalone Maven project, not a module of the root pom.xml
   pom.xml                    Spark 4.2.0, spark-sql-kafka-0-10, spark-avro, postgresql JDBC driver
@@ -654,6 +861,7 @@ spark-streaming/             standalone Maven project, not a module of the root 
 | Spark job fails with `InaccessibleObjectException` | Missing `--add-opens` flags for Java 17. Use `spark-streaming/run.sh`, which sets them via `MAVEN_OPTS`, rather than a bare `mvn exec:java`. |
 | `spark-streaming/run.sh` fails with `Fatal error compiling: error: invalid target release: 17`, or paths in its own output look like `/mnt/c/Users/...` | Typing `bash ...` inside PowerShell often launches WSL's `bash.exe` instead of Git Bash's, since WSL's usually sits earlier on `PATH` - and WSL has its own separate Java/Maven install. `run.sh` detects this and exits with a pointer to open Git Bash directly, but if you ever bypass it: open Git Bash itself (Start menu, or right-click the folder > "Git Bash Here") rather than typing `bash` from PowerShell or cmd. |
 | `SparkAggregationApp`'s Parquet/Postgres batches take minutes instead of seconds, with repeated `WARN HDFSBackedStateStoreProvider ... partitionId=<large number>` lines | An existing checkpoint from before `spark.sql.shuffle.partitions` was tuned down (see Design notes) still has state for the old, much larger partition count. Delete `spark-streaming/checkpoint/dummy-topic-counts-parquet` and `.../dummy-topic-counts-postgres` (and `TRUNCATE topic_counts` if you want a clean table) and restart. |
+| A failing record never reaches the DLT; the app logs `TopicAuthorizationException` or `UNKNOWN_TOPIC_OR_PARTITION` for `dummy-topic-dlt` | The Docker stack predates the DLT, so the topic and its ACLs don't exist yet. From `docker/`, run `docker compose up topic-init`. |
 | `kafka-postgres` exits immediately with a message about `pg_ctlcluster`-style directories and an "unused mount/volume" | The postgres image version in use expects its volume mounted at `/var/lib/postgresql`, not `/var/lib/postgresql/data` (this changed in the postgres:18 image; `docker-compose.yml` already reflects it - relevant only if you change the image tag). |
 
 ## Design notes
@@ -664,8 +872,12 @@ spark-streaming/             standalone Maven project, not a module of the root 
   loaded twice).
 - The consumer's value deserializer is wrapped in Spring's `ErrorHandlingDeserializer` (delegating to
   `KafkaAvroDeserializer`). Without the wrapper, one malformed record makes the consumer retry the same offset
-  forever and block every message behind it. With it, the bad record is logged once and skipped straight away,
-  because Spring treats a `DeserializationException` as non-retryable.
+  forever and block every message behind it. With it, the bad record goes to `dummy-topic-dlt` straight away
+  (with its original bytes), because Spring treats a `DeserializationException` as non-retryable. See
+  "Poison pills" under Reliability.
+- Don't declare a `KafkaTemplate` or `ProducerFactory` bean of your own. Spring Boot only auto-configures its
+  (Avro) ones when none exist, so a second one silently removes the template `DummyProducer` relies on.
+  `RawBytesProducer` wraps its `byte[]` template instead of exposing it as a bean for that reason.
 - Avro strings decode as `org.apache.avro.util.Utf8`, so call `.toString()` when comparing them to a `String`.
 - `spark-streaming/run.sh` always runs `mvn ... compile exec:java`, never a bare `exec:java`. Maven only
   runs the goals you ask for - `exec:java` alone is a single goal, not the default lifecycle, so it will
