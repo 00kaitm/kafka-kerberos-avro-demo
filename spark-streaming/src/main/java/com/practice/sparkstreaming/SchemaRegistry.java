@@ -12,17 +12,20 @@ import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 
 /**
- * Fetches an Avro schema by subject from the Confluent Schema Registry's plain REST API
- * (unauthenticated in this stack, see docker-compose.yml). Deliberately a plain HttpClient call
- * rather than io.confluent:kafka-schema-registry-client, to avoid pulling in a second, differently
- * versioned copy of Jackson alongside the one Spark already bundles.
+ * Fetches a subject's latest schema (both its numeric ID and its JSON) from the Confluent Schema
+ * Registry's plain REST API (unauthenticated in this stack, see docker-compose.yml). Deliberately
+ * a plain HttpClient call rather than io.confluent:kafka-schema-registry-client, to avoid pulling
+ * in a second, differently versioned copy of Jackson alongside the one Spark already bundles.
  */
 final class SchemaRegistry {
+
+    record SchemaInfo(int id, String schema) {
+    }
 
     private SchemaRegistry() {
     }
 
-    static String fetchLatestSchema(String registryUrl, String subject) throws IOException, InterruptedException {
+    static SchemaInfo fetchLatest(String registryUrl, String subject) throws IOException, InterruptedException {
         HttpClient client = HttpClient.newHttpClient();
         HttpRequest request = HttpRequest.newBuilder()
                 .uri(URI.create(registryUrl + "/subjects/" + subject + "/versions/latest"))
@@ -35,6 +38,6 @@ final class SchemaRegistry {
                     + response.statusCode() + ": " + response.body());
         }
         JsonNode body = new ObjectMapper().readTree(response.body());
-        return body.get("schema").asText();
+        return new SchemaInfo(body.get("id").asInt(), body.get("schema").asText());
     }
 }

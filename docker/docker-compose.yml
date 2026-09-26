@@ -104,5 +104,24 @@ services:
       SCHEMA_REGISTRY_KAFKASTORE_TOPIC: _schemas
       JAVA_TOOL_OPTIONS: "-Djava.security.krb5.conf=/etc/kafka/kerberos/krb5-broker.conf"
 
+  # Sink for SparkAggregationApp's windowed counts. Unrelated to the Kerberos/TLS story above -
+  # it's not part of the secured Kafka path - so it's plain postgres auth, not mutual TLS.
+  postgres:
+    image: postgres:18
+    container_name: kafka-postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      # postgres:18+ images store data under a pg_ctlcluster-style versioned subdirectory of
+      # /var/lib/postgresql itself, not .../data - mounting the volume there is what this
+      # particular image version now expects.
+      - postgres-data:/var/lib/postgresql
+      - ./postgres/init-topic-counts.sql:/docker-entrypoint-initdb.d/init-topic-counts.sql:ro
+    environment:
+      POSTGRES_DB: dummy_topic_counts
+      POSTGRES_USER: spark
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Run docker/certs/generate-certs.sh first to create docker/.env}
+
 volumes:
   kafka-data:
+  postgres-data:

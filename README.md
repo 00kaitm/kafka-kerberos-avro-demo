@@ -66,7 +66,8 @@ The broker only accepts clients that authenticate with **Kerberos (SASL/GSSAPI) 
 
 - **JDK 17** (`JAVA_HOME` set). The Maven wrapper (`mvnw`) is included, so you don't need Maven installed.
 - **Docker Desktop** running. On an 8 GB machine, close heavy apps first, because the stack uses about 2 GB.
-- Free local ports: **88** (KDC), **9094** (Kafka), **8081** (Schema Registry), **8080** (the app).
+- Free local ports: **88** (KDC), **9094** (Kafka), **8081** (Schema Registry), **8080** (the app),
+  **5432** (Postgres, only needed for `SparkAggregationApp`).
 
 ## Running the application
 
@@ -210,19 +211,27 @@ The tests don't exercise Kerberos, TLS or ACLs. The Docker stack and a manual `P
 
 ## Spark Structured Streaming (`spark-streaming/`)
 
-A second, independent reader of `dummy-topic`: a Java Spark Structured Streaming job that decodes the same
-Avro `DummyMessage` records and prints them to the console. It's a separate, standalone Maven project (its
-own `pom.xml`, not a module of the root one), because it has nothing to do with the Spring Boot app other
-than reading the same topic.
+A second, independent reader of `dummy-topic`: Java Spark Structured Streaming jobs that decode the same
+Avro `DummyMessage` records. `SparkConsoleApp` just prints them; `SparkAggregationApp` additionally counts
+them per `text` value in tumbling windows and writes those counts to Parquet and Postgres. It's a separate,
+standalone Maven project (its own `pom.xml`, not a module of the root one), because it has nothing to do
+with the Spring Boot app other than reading the same topic.
 
 ```
-Spring Boot producer ──Avro──► dummy-topic ──┬──► DummyConsumer (@KafkaListener, group dummy-consumer-group)
-                                              └──► Spark job (spark-streaming, its own offsets, no group)
+                                                        ┌──► DummyConsumer (@KafkaListener, group dummy-consumer-group)
+                                                        │
+Spring Boot producer ──Avro──► dummy-topic ─────────────┼──► SparkConsoleApp (console)
+                                                        │
+                                                        └──► SparkAggregationApp ──┬──► console (raw pass-through)
+                                                                                   ├──► Parquet (windowed counts)
+                                                                                   └──► Postgres (windowed counts)
 ```
 
-Both readers see every message. Spark's Kafka source doesn't join a consumer group the way `DummyConsumer`
-does - see "How Spark tracks offsets" - so the two don't compete for partitions or interfere with each
-other at all.
+Every arrow out of `dummy-topic` above is an independent read - see "Every query reads Kafka
+independently" below for why that's true even *within* `SparkAggregationApp`, where two of the three
+sinks share one Java `Dataset` object in the code. Spark's Kafka source doesn't join a consumer group the
+way `DummyConsumer` does - see "How Spark tracks offsets" - so none of these compete for partitions or
+interfere with each other.
 
 ### How Spark tracks offsets
 
@@ -230,13 +239,14 @@ other at all.
 partitions, and after processing each record the consumer commits its offset back *to the broker*, so
 other members of the group (and the broker itself) know what's been read.
 
-Spark's Kafka source doesn't do any of that. It's not a member of any consumer group - `subscribe` in
-`SparkConsoleApp` just names the topic, not a group ID - so the broker has no idea what Spark has or
-hasn't read. Instead, at the end of every micro-batch, Spark writes the offsets it just processed into its
-own checkpoint directory (see "Checkpointing" below). On the next batch, or after a restart, it reads that
-checkpoint to know where to resume. This is *why* a checkpoint location is mandatory for every streaming
-query, console sink or not: without it, Spark has nowhere to remember offsets at all, and would have to
-start over from `startingOffsets` every single run.
+Spark's Kafka source doesn't do any of that, despite appearances: it *does* set a `group.id` - a unique
+one it auto-generates per query (`spark-kafka-source-<uuid>-...`) if you don't set one yourself - but only
+because the Kafka protocol requires some group ID to be present on the wire; Spark never uses Kafka's
+group-coordination protocol to get partitions assigned, and it never commits offsets back to the broker.
+Instead, at the end of every micro-batch, Spark writes the offsets it just processed into its own
+checkpoint directory (see "Checkpointing" below) and assigns itself the topic's partitions directly. On
+the next batch, or after a restart *from that same checkpoint*, it reads the checkpoint to know where to
+resume.
 
 ### Confluent's wire format, and why `from_avro` alone isn't enough
 
@@ -307,12 +317,16 @@ repo root so the relative keytab/truststore/checkpoint paths resolve.
 
 `checkpointLocation` (in `spark-streaming.properties`, under `spark-streaming/checkpoint/`) is where a
 Structured Streaming query records which Kafka offsets it has already processed, plus other query state.
-On every batch it writes there before producing output, so if the job crashes and restarts, it resumes
-exactly where it left off instead of reprocessing everything or skipping records - the same guarantee a
-consumer group's committed offsets give a regular Kafka consumer, but tracked entirely on the Spark side.
-The console sink doesn't need exactly-once output (nothing downstream depends on not seeing a duplicate
-print), but every streaming query needs a checkpoint location regardless of sink, because that's where
-offset tracking and query state live.
+On every batch it writes there before producing output, so if the job crashes and restarts *pointed at the
+same location*, it resumes exactly where it left off instead of reprocessing everything or skipping
+records - the same guarantee a consumer group's committed offsets give a regular Kafka consumer, but
+tracked entirely on the Spark side.
+
+Setting it explicitly isn't actually mandatory - if you omit `checkpointLocation`, Spark quietly creates a
+temporary one under your OS temp directory and deletes it when the query or the `SparkSession` stops. The
+query still runs fine either way; the difference only shows up on the *next* run. Set it explicitly (as
+every query in this module does) and a restart resumes; leave it out and a restart starts over from
+`startingOffsets`, because the thing it would have resumed from no longer exists.
 
 ### Java 17 and Spark
 
@@ -323,26 +337,189 @@ them it fails at startup with `InaccessibleObjectException`. `run.sh` sets these
 options, set its working directory to the repo root (same requirement as the Spring Boot app, see
 "Run configurations (IntelliJ)" above), and add `hadoop-local/bin` to its `PATH` environment variable.
 
+## Windowed aggregation, Parquet and Postgres (`SparkAggregationApp`)
+
+`SparkAggregationApp` counts messages per `text` value in 1-minute tumbling windows (`window.duration`),
+with a 2-minute watermark (`watermark.delay`) for late-arriving events, and writes those counts to Parquet
+and to Postgres. Console keeps working exactly as `SparkConsoleApp` left it - this app just also starts
+two more queries alongside it.
+
+If `docker/.env` already existed before this section was added to the repo, it won't have
+`POSTGRES_PASSWORD` yet: re-run `bash docker/certs/generate-certs.sh` (this also rotates the Kafka certs,
+per its own docs above, so follow it with `docker compose up -d --force-recreate` in `docker/`) once, then:
+
+```bash
+bash spark-streaming/run.sh aggregation
+```
+
+### Why `text`, not `id`, and why `createdAt`, not Kafka's own timestamp
+
+The schema has exactly three fields: `id` (a random UUID, unique per message), `text` (free-form, whatever
+you `POST`), and `createdAt` (when the producer built the message). Grouping by `id` would count exactly 1
+in every window, forever - there's nothing to demonstrate. Grouping by `text` is what lets you send the
+same value twice and watch the count become 2.
+
+For *event time* - the column the window and watermark are measured against - `createdAt` is the right
+choice over the Kafka source's own `timestamp` column (when the broker appended the record). They're
+usually only milliseconds apart locally, but they answer different questions: `createdAt` is when the
+event actually happened; Kafka's `timestamp` is when it arrived at the pipeline. Late data is about the
+gap between those two, so measuring event time against the pipeline's own arrival time would erase the
+exact thing this section demonstrates. `LateDataProducer` (below) only works because `createdAt` is
+something you can set independently of when the record is actually sent.
+
+### Event time vs. processing time, in plain terms
+
+*Processing time* is the clock on the machine running Spark - "it's 7:45pm here, right now." *Event time*
+is a timestamp carried inside the data itself - "this thing happened at 7:40pm," regardless of when Spark
+gets around to looking at it. A window defined on processing time groups by when Spark happened to see the
+data, which shifts if Spark is slow or a batch is delayed. A window defined on event time (what `window()`
+does here, over `createdAt`) groups by when the event actually occurred, which is what you almost always
+want for something like "how many things happened per minute" - and it's the only kind of window a
+watermark can reason about, since a watermark is itself a statement about event time.
+
+### How the watermark is calculated, and what it protects
+
+Spark computes the watermark as `(the latest event time it has seen so far across the whole stream) -
+watermark.delay`. That's it - it's not wall-clock-based at all. Every time a new micro-batch arrives with a
+record whose `createdAt` is later than anything seen before, the watermark moves forward by the same
+amount. If the stream goes quiet, the watermark freezes wherever it last was, because there's no new
+"latest event time" to compute it from.
+
+A row is included in the aggregation only if its event time is at or after the current watermark;
+otherwise it's dropped before it ever reaches the `groupBy`. This is exactly what `LateDataProducer`
+demonstrates: a message 30 seconds old is still at or after (`latest seen` − 2 minutes), so it's counted;
+one 5 minutes old is well before it, so it's silently dropped - not an error, not logged by default, just
+absent from the output.
+
+The watermark is also what lets Spark bound its memory: without one, a windowed aggregation would have to
+keep state (the running count) for every window that has *ever* opened, forever, since in principle a
+record for any of them could still arrive. With a watermark, once it passes a window's end, Spark evicts
+that window's state - it can prove no more data for that window is possible - and any further data that
+would have belonged to it just gets dropped instead. That eviction is also *why* append mode is legal for
+the Parquet sink at all: Spark only writes a window's final row once it evicts that window's state, so
+each window is written exactly once, never revised.
+
+### Output modes, and why each sink needs a different one
+
+- **Parquet → `append`.** A file sink can only add new files, never rewrite one already written, so a
+  window's row can only be emitted once, ever. Append-mode is only *legal* on a streaming aggregation
+  because there's a watermark - without one, Spark has no way to know a window is "done," and refuses to
+  start the query at all rather than risk writing an incomplete row and never being able to correct it.
+- **Postgres → `update`.** `foreachBatch` doesn't have the file sink's constraint - each batch just gets
+  handed a `Dataset<Row>` and you decide what to do with it - so `update` mode is available: every batch,
+  Spark hands you whichever windows' counts *changed* in that batch, including windows still accumulating.
+  That's more useful here: `topic_counts` shows a window's count rising in near-real-time, not just a
+  single final value ~2 minutes after the fact. The `ON CONFLICT ... DO UPDATE` upsert (below) is what
+  makes writing the same window repeatedly, as its count keeps changing, safe.
+- **Console → `append`** (unchanged from `SparkConsoleApp`): there's no aggregation in that query at all,
+  just a row-for-row pass-through, so append (emit each new row once) is the only mode that makes sense.
+
+### `foreachBatch`, replays, and why the Postgres write has to be idempotent
+
+Spark has no built-in streaming JDBC sink, so `SparkAggregationApp` uses `foreachBatch`: once per
+micro-batch, Spark hands the batch's `Dataset<Row>` to a callback, and what that callback does with it is
+entirely your own code - here, `upsertBatch` opens a JDBC connection per partition and executes:
+
+```sql
+INSERT INTO topic_counts (window_start, window_end, text, count) VALUES (?, ?, ?, ?)
+ON CONFLICT (window_start, window_end, text) DO UPDATE SET count = EXCLUDED.count
+```
+
+Structured Streaming's fault-tolerance guarantee for `foreachBatch` is **at-least-once, not
+exactly-once** - and this is *why*: Spark's checkpoint and Postgres are two separate systems with no shared
+transaction between them. If the process crashes after the JDBC write commits but before the checkpoint
+records that batch as done, Spark has no way to know the write actually happened, so on restart it reruns
+that exact batch. Without the upsert, that replay would double the count; with it, the replay just writes
+the same `(window_start, window_end, text, count)` row again, and `DO UPDATE SET count = EXCLUDED.count`
+overwrites it with the same value - harmless. The primary key on `(window_start, window_end, text)` (see
+`docker/postgres/init-topic-counts.sql`) is what the upsert's `ON CONFLICT` targets, so it's also what
+makes that triple this table's idempotency key.
+
+### One app, three queries - and why "reads Kafka independently" is true even so
+
+`SparkAggregationApp` starts all three queries (console, Parquet, Postgres) on one `SparkSession`, rather
+than three separate job classes. Since each query manages its own Kafka consumer and its own checkpoint no
+matter what, splitting into separate processes wouldn't buy any isolation this design doesn't already
+have - it would just mean three JVMs and three things to start instead of one. The genuinely
+counterintuitive part: `windowedCounts` (the aggregated `Dataset`) is built **once** in the Java code and
+handed to *two* `.writeStream()` calls (Parquet and Postgres). It's tempting to assume that means Kafka
+gets read once and the result fans out to both sinks - it doesn't. Every `.start()` call creates a fully
+independent streaming query with its own execution plan, including its own instantiation of the Kafka
+source, *regardless* of whether it was built from a `Dataset` object another query also uses. Reusing the
+Java object saves writing the same `groupBy`/`window` code twice; it does not save a Kafka read. Between
+`SparkConsoleApp`'s own read, `SparkAggregationApp`'s console query, and its Parquet and Postgres queries,
+that's up to four independent reads of `dummy-topic` if everything is running at once.
+
+### Triggers
+
+A trigger controls how often Spark checks the source for new data and runs a micro-batch. With no trigger
+specified (as in `SparkConsoleApp`), Spark runs the next batch immediately after the previous one finishes
+- as fast as it can. `Trigger.ProcessingTime(trigger.interval)`, used for the Parquet and Postgres queries
+here, instead runs a batch on a fixed cadence (`trigger.interval`, 10 seconds by default): if a batch
+finishes early, Spark waits out the rest of the interval; if it runs long, the next batch starts
+immediately after, and Spark logs a "falling behind" warning rather than piling up concurrent batches.
+
+### Demonstrating late data
+
+```bash
+bash spark-streaming/run.sh late-data counted_late 30     # ~30s old: inside the watermark, gets counted
+bash spark-streaming/run.sh late-data dropped_too_old 300  # 5 minutes old: outside it, silently dropped
+```
+
+`LateDataProducer` builds the Confluent wire format by hand (same as `KafkaAvroSource` strips on the way
+in) and publishes directly to `dummy-topic` with a `createdAt` you choose, bypassing the Spring Boot
+producer's `Instant.now()` entirely. Its `<text>` argument can't contain spaces (Maven's `exec.args`
+splits on whitespace with no quoting) - use underscores as above.
+
+The console query prints both records regardless - it has no aggregation or watermark, so it shows every
+raw message unconditionally. The difference only shows up in the aggregated output: query
+`topic_counts` (below) or inspect the Parquet output, and `counted_late` is there while `dropped_too_old`
+never appears, in either sink.
+
+### Querying Postgres
+
+```bash
+docker exec kafka-postgres psql -U spark -d dummy_topic_counts -c "SELECT * FROM topic_counts ORDER BY window_start, text;"
+```
+
+Re-run it a few seconds apart while messages are flowing and you can watch a window's `count` climb in
+`update` mode, then stop changing once the watermark passes that window's end.
+
+### Inspecting the Parquet output
+
+```bash
+bash spark-streaming/run.sh parquet-inspect
+```
+
+`ParquetInspector` is a plain batch (non-streaming) read of `parquet.output.path`, so this stays Java-only
+rather than requiring pandas/DuckDB/etc. just to look at the data. Remember append-mode's implication: a
+window you just triggered won't appear here (or in Postgres, for that matter, since Postgres output for
+that window is still climbing) until the watermark has actually passed its end - for the defaults here,
+usually a few minutes after the messages that filled it were sent, not immediately.
+
 ## Project layout
 
 ```
 docker/
-  docker-compose.yml        KDC, Kafka broker (KRaft) and Schema Registry
+  docker-compose.yml        KDC, Kafka broker (KRaft), Schema Registry and Postgres
   init-topics.sh            creates dummy-topic, _schemas and the ACLs (idempotent; run by the topic-init service)
   certs/                    generate-certs.sh; the CA, keystores and truststore it creates are git-ignored
   .env.example              the variable names of docker/.env (the real, generated .env is git-ignored)
   kerberos/                 KDC image, krb5 configs, keytabs (generated), KDC database (generated)
+  postgres/init-topic-counts.sql   creates topic_counts; run once by the postgres image on first startup
 src/main/avro/              Avro schema
 src/main/java/...           controller, producer, consumer
 src/test/                   unit, web-layer and embedded-Kafka tests
 spark-streaming/             standalone Maven project, not a module of the root pom.xml
-  pom.xml                    Spark 4.2.0, spark-sql-kafka-0-10, spark-avro
+  pom.xml                    Spark 4.2.0, spark-sql-kafka-0-10, spark-avro, postgresql JDBC driver
   setup-windows-hadoop.sh    one-time, Windows only: downloads winutils.exe/hadoop.dll
-  run.sh                     sets MAVEN_OPTS (add-opens, hadoop.home.dir) and runs the job
-  src/main/resources/        spark-streaming.properties: bootstrap servers, topic, security
-  src/main/java/...          SparkConsoleApp, SchemaRegistry, ConfigLoader
+  run.sh                     picks the app, sets MAVEN_OPTS (add-opens, hadoop.home.dir), always recompiles
+  src/main/resources/        spark-streaming.properties: bootstrap servers, topic, security, window/watermark
+  src/main/java/...          SparkConsoleApp, SparkAggregationApp, LateDataProducer, ParquetInspector,
+                             KafkaAvroSource, SchemaRegistry, ConfigLoader
   hadoop-local/               downloaded winutils.exe/hadoop.dll, git-ignored
-  checkpoint/                 Structured Streaming checkpoint, git-ignored
+  checkpoint/                 one subdirectory per query's Structured Streaming checkpoint, git-ignored
+  output/                     Parquet output (dummy-topic-counts), git-ignored
 ```
 
 ## Troubleshooting
@@ -358,6 +535,9 @@ spark-streaming/             standalone Maven project, not a module of the root 
 | Docker commands from Git Bash mangle paths | Use PowerShell, or set `MSYS_NO_PATHCONV=1` and add Docker's `resources/bin` folder to `PATH`. |
 | Spark job fails with `HADOOP_HOME and hadoop.home.dir are unset`, or `Could not locate Hadoop executable: .../winutils.exe` | Windows only. Run `bash spark-streaming/setup-windows-hadoop.sh`, then use `spark-streaming/run.sh` (or copy its `MAVEN_OPTS`/`PATH` setup into your run configuration) rather than a bare `mvn exec:java`. |
 | Spark job fails with `InaccessibleObjectException` | Missing `--add-opens` flags for Java 17. Use `spark-streaming/run.sh`, which sets them via `MAVEN_OPTS`, rather than a bare `mvn exec:java`. |
+| `spark-streaming/run.sh` fails with `Fatal error compiling: error: invalid target release: 17`, or paths in its own output look like `/mnt/c/Users/...` | Typing `bash ...` inside PowerShell often launches WSL's `bash.exe` instead of Git Bash's, since WSL's usually sits earlier on `PATH` - and WSL has its own separate Java/Maven install. `run.sh` detects this and exits with a pointer to open Git Bash directly, but if you ever bypass it: open Git Bash itself (Start menu, or right-click the folder > "Git Bash Here") rather than typing `bash` from PowerShell or cmd. |
+| `SparkAggregationApp`'s Parquet/Postgres batches take minutes instead of seconds, with repeated `WARN HDFSBackedStateStoreProvider ... partitionId=<large number>` lines | An existing checkpoint from before `spark.sql.shuffle.partitions` was tuned down (see Design notes) still has state for the old, much larger partition count. Delete `spark-streaming/checkpoint/dummy-topic-counts-parquet` and `.../dummy-topic-counts-postgres` (and `TRUNCATE topic_counts` if you want a clean table) and restart. |
+| `kafka-postgres` exits immediately with a message about `pg_ctlcluster`-style directories and an "unused mount/volume" | The postgres image version in use expects its volume mounted at `/var/lib/postgresql`, not `/var/lib/postgresql/data` (this changed in the postgres:18 image; `docker-compose.yml` already reflects it - relevant only if you change the image tag). |
 
 ## Design notes
 
@@ -370,3 +550,10 @@ spark-streaming/             standalone Maven project, not a module of the root 
   forever and block every message behind it. With it, the bad record is logged once and skipped straight away,
   because Spring treats a `DeserializationException` as non-retryable.
 - Avro strings decode as `org.apache.avro.util.Utf8`, so call `.toString()` when comparing them to a `String`.
+- `spark-streaming/run.sh` always runs `mvn ... compile exec:java`, never a bare `exec:java`. Maven only
+  runs the goals you ask for - `exec:java` alone is a single goal, not the default lifecycle, so it will
+  silently execute whatever's already in `target/classes` even after you've edited and saved a `.java`
+  file, with no warning that anything's stale.
+- `SparkAggregationApp` sets `spark.sql.shuffle.partitions` to 4. Spark's default (200) is sized for a
+  cluster; for a handful of test rows in `local[*]`, it just means scheduling 200 mostly-empty tasks (and,
+  per-partition, opening a JDBC connection for any that aren't) every batch instead of a handful.

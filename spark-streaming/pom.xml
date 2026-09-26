@@ -21,6 +21,8 @@
 		<project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
 		<spark.version>4.2.0</spark.version>
 		<scala.binary.version>2.13</scala.binary.version>
+		<!-- Overridable with -Dexec.mainClass=... (see run.sh) to pick which app to run. -->
+		<exec.mainClass>com.practice.sparkstreaming.SparkConsoleApp</exec.mainClass>
 	</properties>
 
 	<dependencies>
@@ -44,6 +46,29 @@
 			<artifactId>spark-avro_${scala.binary.version}</artifactId>
 			<version>${spark.version}</version>
 		</dependency>
+
+		<!--
+			Already on the classpath transitively via the spark-* dependencies above; declared
+			directly because LateDataProducer uses these APIs itself. Pinned to the exact versions
+			Spark 4.2.0 already resolves (confirmed with `mvn dependency:tree`), so this can't
+			introduce a second, conflicting copy of either.
+		-->
+		<dependency>
+			<groupId>org.apache.avro</groupId>
+			<artifactId>avro</artifactId>
+			<version>1.12.1</version>
+		</dependency>
+		<dependency>
+			<groupId>org.apache.kafka</groupId>
+			<artifactId>kafka-clients</artifactId>
+			<version>3.9.2</version>
+		</dependency>
+
+		<dependency>
+			<groupId>org.postgresql</groupId>
+			<artifactId>postgresql</artifactId>
+			<version>42.7.13</version>
+		</dependency>
 	</dependencies>
 
 	<build>
@@ -65,7 +90,7 @@
 				<artifactId>exec-maven-plugin</artifactId>
 				<version>3.5.0</version>
 				<configuration>
-					<mainClass>com.practice.sparkstreaming.SparkConsoleApp</mainClass>
+					<mainClass>${exec.mainClass}</mainClass>
 				</configuration>
 			</plugin>
 		</plugins>

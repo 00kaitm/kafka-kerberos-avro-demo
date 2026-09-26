@@ -31,6 +31,12 @@ TRUSTSTORE_PASS=$(new_password)
 KDC_MASTER_PASS=$(grep -s '^KDC_MASTER_PASSWORD=' "$ENV_FILE" | cut -d= -f2- || true)
 KDC_MASTER_PASS=${KDC_MASTER_PASS:-$(new_password)}
 
+# Same reasoning as the KDC password: postgres only runs init-topic-counts.sql once, against an
+# empty data volume, using whatever POSTGRES_PASSWORD it's given at that moment. A re-run here
+# must keep that value, not invent one the existing volume no longer matches.
+POSTGRES_PASS=$(grep -s '^POSTGRES_PASSWORD=' "$ENV_FILE" | cut -d= -f2- || true)
+POSTGRES_PASS=${POSTGRES_PASS:-$(new_password)}
+
 rm -f *.jks *.pem *.crt *.csr *.srl *.key
 
 echo "== Generating CA =="
@@ -93,6 +99,7 @@ KAFKA_CLIENT_KEYSTORE_PASSWORD=$CLIENT_KS_PASS
 KAFKA_REGISTRY_KEYSTORE_PASSWORD=$REGISTRY_KS_PASS
 KAFKA_TRUSTSTORE_PASSWORD=$TRUSTSTORE_PASS
 KDC_MASTER_PASSWORD=$KDC_MASTER_PASS
+POSTGRES_PASSWORD=$POSTGRES_PASS
 EOF
 )
 

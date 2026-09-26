@@ -47,6 +47,7 @@ docker/kerberos/kdc-data/
 
 ### spark-streaming module ###
 spark-streaming/checkpoint/
+spark-streaming/output/
 # Downloaded winutils.exe/hadoop.dll (Windows-only Hadoop shim), never commit third-party binaries.
 spark-streaming/hadoop-local/bin/
 
