@@ -691,7 +691,8 @@ case for one failing record, from its first failure to its offset being committe
 | **Total** | **~136s worst case, ~11s normally** - against a 300s limit |
 
 That's the pessimistic reading, counting the whole sequence as one gap between polls. In practice
-`DefaultErrorHandler` seeks back and returns to `poll()` after every failed attempt, so each individual gap is
+`DefaultErrorHandler` seeks back and returns to `poll()` after every failed attempt (the `Seeking to offset`
+log line after each one, below), so each individual gap is
 at most one back off (4s) plus processing - except the last, which includes the DLT publish. If you ever
 need waits longer than `max.poll.interval.ms`, that's what `@RetryableTopic`, or Spring's
 `ContainerPausingBackOffHandler`, is for.
@@ -769,7 +770,7 @@ for in the app's log:
 
 | Sent | Log |
 |---|---|
-| `fail-transient-1` | Two `FailureDemo : Simulating a transient failure ... attempt 1 of 2` / `attempt 2 of 2` warnings, about 1s and 2s apart, then `DummyConsumer : Received message ... (delivery attempt 3)`. |
+| `fail-transient-1` | Two `FailureDemo : Simulating a transient failure ... attempt 1 of 2` / `attempt 2 of 2` warnings, about 1s and 2s apart, then `DummyConsumer : Received message ... (delivery attempt 3)`. After each failed attempt: `Seeking to offset N for partition dummy-topic-0` and `Record in retry and not yet recovered` - the error handler rewinding the consumer so the next `poll()` fetches the same record again. |
 | `fail-always-1` | Five `Simulating a failure that never recovers ... attempt N` warnings over ~11s, then `DeadLetterInspector : Dead letter at dummy-topic-dlt-0@... from dummy-topic-0@... failed with ...RetryableProcessingException: Simulated permanent outage ... (attempt 5) \| value: Avro {...}`. |
 | `fail-invalid-1` | No retries: straight to `Dead letter ... failed with ...InvalidMessageException: Simulated validation failure ...`. |
 | poison pill | The endpoint answers `sent raw bytes to dummy-topic partition 0 offset N`, then `Dead letter ... from dummy-topic-0@N ... failed with org.springframework.kafka.support.serializer.DeserializationException: failed to deserialize \| value: 8 raw bytes, not decodable as Avro: hex 6e6f74206176726f / text "not avro"`. |

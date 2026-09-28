@@ -5,6 +5,7 @@ import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.clients.producer.RecordMetadata;
 import org.apache.kafka.common.serialization.ByteArraySerializer;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.kafka.core.ProducerFactory;
 import org.springframework.stereotype.Component;
@@ -19,7 +20,9 @@ import java.util.concurrent.ExecutionException;
  * Deliberately a wrapper, not a KafkaTemplate bean: Spring Boot only auto-configures its own
  * (Avro) KafkaTemplate when no other KafkaTemplate bean exists, so declaring a second one would
  * silently remove the one DummyProducer uses. This copies Boot's producer config - same brokers,
- * Kerberos and TLS, same acks/idempotence - overriding only the value serializer.
+ * Kerberos and TLS, same acks/idempotence - overriding the value serializer, and the client ID:
+ * the copy doesn't inherit Spring's "<app name>-producer" client ID prefix, and would otherwise show
+ * up in logs and broker metrics as an anonymous "producer-N".
  */
 @Component
 public class RawBytesProducer {
@@ -27,9 +30,11 @@ public class RawBytesProducer {
     private final KafkaTemplate<String, byte[]> template;
 
     @SuppressWarnings("unchecked")
-    public RawBytesProducer(ProducerFactory<?, ?> producerFactory) {
-        this.template = new KafkaTemplate<>((ProducerFactory<String, byte[]>) producerFactory,
-                Map.of(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, ByteArraySerializer.class));
+    public RawBytesProducer(ProducerFactory<?, ?> producerFactory,
+                            @Value("${spring.application.name}") String applicationName) {
+        this.template = new KafkaTemplate<>((ProducerFactory<String, byte[]>) producerFactory, Map.of(
+                ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, ByteArraySerializer.class,
+                ProducerConfig.CLIENT_ID_CONFIG, applicationName + "-raw-bytes-producer"));
     }
 
     public KafkaTemplate<String, byte[]> template() {
