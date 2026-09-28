@@ -555,6 +555,24 @@ not at application startup:
 
 followed by `Instantiated an idempotent producer.`
 
+`LateDataProducer` doesn't show that block: it's printed by the Kafka client at INFO level, and the
+Spark module's logging hides INFO for this tool. (The module has no log4j2 config of its own. Spark
+installs its built-in one, root level INFO, only when a Spark session starts, which `LateDataProducer`
+never does - so log4j2's fallback applies, and that shows ERROR and above only.) Rather than adding a
+log4j2 config file, which would replace Spark's built-in defaults for every app in the module,
+`LateDataProducer` prints its effective settings itself, before sending:
+
+```
+Producer config: acks=-1 enable.idempotence=true retries=2147483647 max.in.flight.requests.per.connection=5 delivery.timeout.ms=120000
+Sent "idem_check" with createdAt=... (5 seconds ago)
+```
+
+Those values come from Kafka's own `ProducerConfig`, built from exactly the properties the producer gets,
+so they're what the producer really runs with, not what the properties file asked for. That makes the
+quiet rule above visible: with `producer.acks=1` and `producer.enable.idempotence` removed, the line reads
+`acks=1 enable.idempotence=false`; with `producer.acks=1` and idempotence left `true`, the tool stops with
+`ConfigException: Must set acks to all in order to use the idempotent producer`.
+
 **What idempotence does, in plain terms.** Each producer gets a producer ID from the broker, and numbers
 every batch it sends to each partition (a sequence number). If a send times out and the producer retries,
 but the first attempt had actually been written, the broker sees a sequence number it already has and
@@ -836,7 +854,7 @@ src/main/avro/              Avro schema
 src/main/java/...           controllers, producer, consumer, error handling / DLT
 src/test/                   unit, web-layer and embedded-Kafka tests
 spark-streaming/             standalone Maven project, not a module of the root pom.xml
-  pom.xml                    Spark 4.2.0, spark-sql-kafka-0-10, spark-avro, postgresql JDBC driver
+  pom.xml                    Spark 4.2.0, spark-sql-kafka-0-10, spark-avro, postgresql JDBC driver; Maven plugins pinned to the root project's versions
   setup-windows-hadoop.sh    one-time, Windows only: downloads winutils.exe/hadoop.dll
   run.sh                     picks the app, sets MAVEN_OPTS (add-opens, hadoop.home.dir), always recompiles
   src/main/resources/        spark-streaming.properties: bootstrap servers, topic, security, window/watermark

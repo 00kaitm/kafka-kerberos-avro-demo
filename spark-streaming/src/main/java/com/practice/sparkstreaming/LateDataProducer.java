@@ -56,6 +56,21 @@ public class LateDataProducer {
 
         byte[] value = encode(schemaInfo.id(), avroSchema, record);
 
+        Properties producerProps = producerProperties(config);
+        // Printed rather than logged: this tool never starts Spark, so Spark's log4j2 defaults are
+        // never installed, and log4j2's own fallback hides the Kafka client's INFO-level
+        // "ProducerConfig values:" block. See README "Idempotent producer".
+        System.out.println(effectiveReliabilitySettings(producerProps));
+
+        try (KafkaProducer<String, byte[]> producer = new KafkaProducer<>(producerProps)) {
+            producer.send(new ProducerRecord<>(topic, null, value)).get();
+        }
+
+        System.out.printf("Sent \"%s\" with createdAt=%s (%d seconds ago)%n",
+                text, Instant.ofEpochMilli(createdAtMillis), secondsAgo);
+    }
+
+    static Properties producerProperties(Properties config) {
         Properties producerProps = new Properties();
         producerProps.put("bootstrap.servers", config.getProperty("bootstrap.servers"));
         producerProps.put("key.serializer", StringSerializer.class.getName());
@@ -73,13 +88,23 @@ public class LateDataProducer {
                 producerProps.put(key.substring("producer.".length()), config.getProperty(key));
             }
         }
+        return producerProps;
+    }
 
-        try (KafkaProducer<String, byte[]> producer = new KafkaProducer<>(producerProps)) {
-            producer.send(new ProducerRecord<>(topic, null, value)).get();
-        }
-
-        System.out.printf("Sent \"%s\" with createdAt=%s (%d seconds ago)%n",
-                text, Instant.ofEpochMilli(createdAtMillis), secondsAgo);
+    /**
+     * The reliability settings the producer will actually run with, parsed by Kafka's own
+     * ProducerConfig exactly as KafkaProducer's constructor does - so "all" shows up resolved to
+     * -1, and idempotence shows up false if some other setting conflicted with it.
+     */
+    static String effectiveReliabilitySettings(Properties producerProps) {
+        ProducerConfig effective = new ProducerConfig(producerProps);
+        return String.format(
+                "Producer config: acks=%s enable.idempotence=%s retries=%d max.in.flight.requests.per.connection=%d delivery.timeout.ms=%d",
+                effective.getString(ProducerConfig.ACKS_CONFIG),
+                effective.getBoolean(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG),
+                effective.getInt(ProducerConfig.RETRIES_CONFIG),
+                effective.getInt(ProducerConfig.MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION),
+                effective.getInt(ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG));
     }
 
     private static byte[] encode(int schemaId, Schema schema, GenericRecord record) throws Exception {
