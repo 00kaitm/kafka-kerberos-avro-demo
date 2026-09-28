@@ -606,13 +606,31 @@ rather than written to a single copy. Leader failover - another replica taking o
 needs more than one broker to demonstrate.
 
 **Why you can't trigger `NotEnoughReplicas` on one broker, even on purpose.** Kafka lets you set
-`min.insync.replicas` higher than a topic's replication factor, but the broker doesn't enforce the
-impossible value: it uses `min(replication factor, min.insync.replicas)` (`effectiveMinIsr` in the
-broker's `Partition.scala`, present in the 3.8.0 broker used here). So an RF=1 topic with
-`min.insync.replicas=2` is treated as min ISR 1, and `acks=all` writes to it succeed. This was tried
-against this stack: creating such a topic works, and an `acks=all` console-producer write to it goes
-through with no error. The refusal only happens when a topic has *more* replicas than are currently in
-sync, which needs followers, which needs more than one broker.
+`min.insync.replicas` higher than a topic's replication factor, but since **Kafka 3.7.0** the broker doesn't
+enforce the impossible value: it uses `min(replication factor, min.insync.replicas)`. So an RF=1 topic with
+`min.insync.replicas=2` is treated as min ISR 1, and `acks=all` writes to it succeed. The refusal only
+happens when a topic has *more* replicas than are currently in sync, which needs followers, which needs
+more than one broker.
+
+- **Where this comes from.** `effectiveMinIsr` in the broker's `Partition.scala`
+  ([3.8.0, lines 376-383](https://github.com/apache/kafka/blob/3.8.0/core/src/main/scala/kafka/cluster/Partition.scala#L376-L383)),
+  which the produce path uses for its check
+  ([lines 1370-1377](https://github.com/apache/kafka/blob/3.8.0/core/src/main/scala/kafka/cluster/Partition.scala#L1370-L1377)).
+  It was added by [KAFKA-15583](https://issues.apache.org/jira/browse/KAFKA-15583)
+  ([commit `edc7e10`](https://github.com/apache/kafka/commit/edc7e10a745c350ad1efa9e4866370dc8ea0e034), first
+  released in 3.7.0), a sub-task of [KIP-966: Eligible Leader Replicas](https://cwiki.apache.org/confluence/display/KAFKA/KIP-966%3A+Eligible+Leader+Replicas).
+  The `Elr` / `LastKnownElr` columns `kafka-topics.sh --describe` prints on this broker come from the same KIP.
+- **The documentation doesn't mention it.** The `min.insync.replicas` topic config docs still describe the
+  plain rule - an `acks=all` write fails whenever the in-sync replica set is smaller than
+  `min.insync.replicas` - with no word about capping it at the replication factor.
+- **Verified on this stack (broker 3.8.0).** An RF=1 topic with `min.insync.replicas=2` was created, and a
+  console-producer write with `acks=all` (confirmed from the producer's own `acks = -1` config log) and
+  `--sync` (so it waited for the broker's answer) succeeded, and the record was read back at offset 0.
+- **Older brokers: from the source, not tested.** In 3.6.0 the same check compares against the raw
+  `min.insync.replicas`
+  ([3.6.0, lines 1303-1308](https://github.com/apache/kafka/blob/3.6.0/core/src/main/scala/kafka/cluster/Partition.scala#L1303-L1308)),
+  so on a 3.6 or older broker this demo should fail with `NOT_ENOUGH_REPLICAS`, as the documentation
+  describes. No pre-3.7 broker was run here to confirm that.
 
 **What you'd see in a real cluster, and the timeout trap.** `NotEnoughReplicasException` is a
 *retriable* error in the Kafka client, because a lagging replica usually catches up within seconds. So the
